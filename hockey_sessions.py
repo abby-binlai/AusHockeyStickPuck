@@ -1105,8 +1105,9 @@ else:
 
         # Only show schedule fields useful for verification.
         display_cols = ["start", "end", "session", "source"]
+        public_rink_rows = public_rink_rows.reindex(columns=display_cols)
         st.dataframe(
-            public_rink_rows[display_cols],
+            public_rink_rows,
             hide_index=True,
             use_container_width=True,
             column_config={
