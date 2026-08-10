@@ -14,16 +14,12 @@ Run:
 from __future__ import annotations
 
 import re
-import base64
-import html as htmlmod
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Iterable
-from urllib.parse import urlencode, urlparse, parse_qs, quote, urlsplit, urlunsplit, parse_qsl
+from urllib.parse import urlencode
 
 import pandas as pd
-from zoneinfo import ZoneInfo
-from dateutil.rrule import rrulestr
 import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -565,518 +561,31 @@ def scrape_daysmart(page, rink: dict, start: date, end: date) -> list[dict]:
     return scrape_all_scopes(page, rink, start, end)
 
 
-def _unfold_ics(text: str) -> list[str]:
-    """Unfold RFC 5545 continuation lines."""
-    raw = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    out = []
-    for line in raw:
-        if line.startswith((" ", "\t")) and out:
-            out[-1] += line[1:]
-        else:
-            out.append(line)
-    return out
-
-
-def _parse_ics_dt(key: str, value: str) -> datetime | None:
-    """
-    Parse common Google Calendar ICS date/time formats.
-    Returns an America/Chicago-aware datetime where possible.
-    """
-    tz = ZoneInfo("America/Chicago")
-    value = value.strip()
-
-    try:
-        # All-day date.
-        if "VALUE=DATE" in key.upper() or re.fullmatch(r"\d{8}", value):
-            dt = datetime.strptime(value[:8], "%Y%m%d")
-            return dt.replace(tzinfo=tz)
-
-        # UTC timestamp.
-        if value.endswith("Z"):
-            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-            return dt.astimezone(tz)
-
-        # Explicit TZID in property key.
-        m = re.search(r"TZID=([^;:]+)", key, re.I)
-        if m:
-            tzid = m.group(1)
-            try:
-                event_tz = ZoneInfo(tzid)
-            except Exception:
-                event_tz = tz
-            dt = datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=event_tz)
-            return dt.astimezone(tz)
-
-        # Floating time: treat as local Austin time.
-        dt = datetime.strptime(value, "%Y%m%dT%H%M%S")
-        return dt.replace(tzinfo=tz)
-    except Exception:
-        return None
-
-
-def _parse_google_ics(ics_text: str, selected: date, source_url: str) -> list[dict]:
-    """Parse Barn Time / Pond Time events from a public Google Calendar ICS feed."""
-    lines = _unfold_ics(ics_text)
-    events = []
-    current = None
-
-    for line in lines:
-        if line == "BEGIN:VEVENT":
-            current = {}
-            continue
-        if line == "END:VEVENT":
-            if current:
-                summary = norm(current.get("SUMMARY", ""))
-                lower = summary.lower()
-
-                session = None
-                if "barn time" in lower:
-                    session = "Barn Time"
-                elif "pond time" in lower:
-                    session = "Pond Time"
-
-                if session:
-                    start_dt = current.get("_START_DT")
-                    end_dt = current.get("_END_DT")
-                    if start_dt and start_dt.date() == selected:
-                        events.append({
-                            "date": selected.isoformat(),
-                            "start": start_dt.strftime("%-I:%M %p"),
-                            "end": end_dt.strftime("%-I:%M %p") if end_dt else "",
-                            "rink": "The Pond",
-                            "session": session,
-                            "details": f"GOOGLE CALENDAR ICS | {summary}",
-                            "source": source_url,
-                        })
-            current = None
-            continue
-
-        if current is None or ":" not in line:
-            continue
-
-        key, value = line.split(":", 1)
-        base_key = key.split(";", 1)[0].upper()
-
-        if base_key == "SUMMARY":
-            current["SUMMARY"] = value.replace("\\,", ",").replace("\\n", " ")
-        elif base_key == "DTSTART":
-            current["_START_DT"] = _parse_ics_dt(key, value)
-        elif base_key == "DTEND":
-            current["_END_DT"] = _parse_ics_dt(key, value)
-
-    return events
-
-
-def _google_embed_for_date(src: str, selected: date) -> str:
-    """
-    Force a Google Calendar embed into agenda mode for one selected date.
-    This lets Google expand recurring events itself instead of us trying to
-    interpret RRULE/EXDATE/RDATE recurrence logic from ICS.
-    """
-    parts = urlsplit(src)
-    params = dict(parse_qsl(parts.query, keep_blank_values=True))
-    ymd = selected.strftime("%Y%m%d")
-
-    params["mode"] = "AGENDA"
-    params["dates"] = f"{ymd}/{ymd}"
-    params["showTitle"] = "0"
-    params["showNav"] = "0"
-    params["showDate"] = "1"
-    params["showPrint"] = "0"
-    params["showTabs"] = "0"
-    params["showCalendars"] = "0"
-    params["showTz"] = "0"
-    params["ctz"] = "America/Chicago"
-
-    return urlunsplit((
-        parts.scheme,
-        parts.netloc,
-        parts.path,
-        urlencode(params, doseq=True),
-        parts.fragment,
-    ))
-
-
-def _pond_event_rows_from_text(
-    body_text: str,
-    selected: date,
-    source_url: str,
-) -> list[dict]:
-    """
-    Parse only exact Barn Time / Pond Time occurrences from a one-day Google
-    Calendar agenda view.
-
-    The agenda text commonly places the event title and time on nearby lines,
-    so inspect a small local window only. Never borrow context from the whole
-    calendar.
-    """
-    raw_lines = re.split(r"[\r\n]+", body_text or "")
-    lines = [norm(x) for x in raw_lines if norm(x)]
-    rows = []
-    seen = set()
-
-    for i, line in enumerate(lines):
-        lower = line.lower()
-
-        if "barn time" in lower:
-            session = "Barn Time"
-        elif "pond time" in lower:
-            session = "Pond Time"
-        else:
-            continue
-
-        # Keep a very small context window around this exact event.
-        lo = max(0, i - 3)
-        hi = min(len(lines), i + 4)
-        context_lines = lines[lo:hi]
-        context = " | ".join(context_lines)
-
-        start_time, end_time = times_from_text(context)
-
-        # Google agenda sometimes formats a range with an en dash / hyphen
-        # but our generic parser may see only one time. Try a direct range.
-        if not end_time:
-            m = re.search(
-                r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM))\s*[-–—]\s*"
-                r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM))",
-                context,
-                re.I,
-            )
-            if m:
-                start_time = norm(m.group(1)).upper()
-                end_time = norm(m.group(2)).upper()
-
-        if not start_time:
-            continue
-
-        key = (session, start_time, end_time)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        rows.append({
-            "date": selected.isoformat(),
-            "start": start_time,
-            "end": end_time,
-            "rink": "The Pond",
-            "session": session,
-            "details": f"GOOGLE CALENDAR AGENDA | {context}",
-            "source": source_url,
-        })
-
-    return rows
-
-
-POND_GOOGLE_CALENDARS = [
-    {
-        "calendar_id": "thebarnrinkcalendar@gmail.com",
-        "session": "Barn Time",
-    },
-    {
-        "calendar_id": "thepondcalendar@gmail.com",
-        "session": "Pond Time",
-    },
-]
-
-
-def _unfold_ics_lines(ics_text: str) -> list[str]:
-    raw = ics_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    out = []
-    for line in raw:
-        if line.startswith((" ", "\t")) and out:
-            out[-1] += line[1:]
-        else:
-            out.append(line)
-    return out
-
-
-def _ics_unescape(value: str) -> str:
-    return (
-        value.replace("\\n", " ")
-             .replace("\\N", " ")
-             .replace("\\,", ",")
-             .replace("\\;", ";")
-             .replace("\\\\", "\\")
-    )
-
-
-def _parse_ics_datetime(prop_name: str, value: str) -> datetime | None:
-    """Parse common Google Calendar DTSTART/DTEND/EXDATE values."""
-    local_tz = ZoneInfo("America/Chicago")
-    value = value.strip()
-
-    try:
-        if "VALUE=DATE" in prop_name.upper() or re.fullmatch(r"\d{8}", value):
-            return datetime.strptime(value[:8], "%Y%m%d").replace(tzinfo=local_tz)
-
-        if value.endswith("Z"):
-            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
-            return dt.replace(tzinfo=timezone.utc).astimezone(local_tz)
-
-        tz_match = re.search(r"TZID=([^;:]+)", prop_name, re.I)
-        if tz_match:
-            tzid = tz_match.group(1)
-            try:
-                tz = ZoneInfo(tzid)
-            except Exception:
-                tz = local_tz
-            dt = datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=tz)
-            return dt.astimezone(local_tz)
-
-        dt = datetime.strptime(value, "%Y%m%dT%H%M%S")
-        return dt.replace(tzinfo=local_tz)
-    except Exception:
-        return None
-
-
-def _parse_ics_events(ics_text: str) -> list[dict]:
-    """Parse VEVENT blocks while preserving recurrence information."""
-    lines = _unfold_ics_lines(ics_text)
-    events = []
-    current = None
-
-    for line in lines:
-        if line == "BEGIN:VEVENT":
-            current = {"EXDATE": []}
-            continue
-
-        if line == "END:VEVENT":
-            if current is not None:
-                events.append(current)
-            current = None
-            continue
-
-        if current is None or ":" not in line:
-            continue
-
-        key, value = line.split(":", 1)
-        base = key.split(";", 1)[0].upper()
-
-        if base == "SUMMARY":
-            current["SUMMARY"] = _ics_unescape(value)
-        elif base == "DTSTART":
-            current["DTSTART"] = _parse_ics_datetime(key, value)
-        elif base == "DTEND":
-            current["DTEND"] = _parse_ics_datetime(key, value)
-        elif base == "RRULE":
-            current["RRULE"] = value.strip()
-        elif base == "RECURRENCE-ID":
-            current["RECURRENCE-ID"] = _parse_ics_datetime(key, value)
-        elif base == "EXDATE":
-            for part in value.split(","):
-                dt = _parse_ics_datetime(key, part)
-                if dt:
-                    current["EXDATE"].append(dt)
-        elif base == "STATUS":
-            current["STATUS"] = value.strip().upper()
-
-    return events
-
-
-def _expand_ics_event_for_date(event: dict, selected: date) -> list[tuple[datetime, datetime | None]]:
-    """
-    Expand one VEVENT for exactly the selected local date.
-
-    Handles normal events, recurring RRULE events, EXDATE exclusions, and
-    detached recurrence overrides (RECURRENCE-ID events).
-    """
-    local_tz = ZoneInfo("America/Chicago")
-    start_dt = event.get("DTSTART")
-    end_dt = event.get("DTEND")
-
-    if not start_dt or event.get("STATUS") == "CANCELLED":
-        return []
-
-    if start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=local_tz)
-    else:
-        start_dt = start_dt.astimezone(local_tz)
-
-    if end_dt:
-        if end_dt.tzinfo is None:
-            end_dt = end_dt.replace(tzinfo=local_tz)
-        else:
-            end_dt = end_dt.astimezone(local_tz)
-
-    duration = (end_dt - start_dt) if end_dt else None
-    day_start = datetime.combine(selected, datetime.min.time(), tzinfo=local_tz)
-    day_end = day_start + timedelta(days=1)
-
-    # Detached override / ordinary non-recurring event.
-    if not event.get("RRULE"):
-        if day_start <= start_dt < day_end:
-            return [(start_dt, start_dt + duration if duration else end_dt)]
-        return []
-
-    try:
-        rule = rrulestr(event["RRULE"], dtstart=start_dt)
-        occurrences = rule.between(day_start, day_end, inc=True)
-    except Exception:
-        return []
-
-    excluded = set()
-    for ex in event.get("EXDATE", []):
-        if ex.tzinfo is None:
-            ex = ex.replace(tzinfo=local_tz)
-        else:
-            ex = ex.astimezone(local_tz)
-        excluded.add(ex.replace(microsecond=0))
-
-    rows = []
-    for occ in occurrences:
-        if occ.tzinfo is None:
-            occ = occ.replace(tzinfo=local_tz)
-        else:
-            occ = occ.astimezone(local_tz)
-
-        if occ.replace(microsecond=0) in excluded:
-            continue
-
-        rows.append((occ, occ + duration if duration else None))
-
-    return rows
-
-
-def _format_clock(dt: datetime | None) -> str:
-    if not dt:
-        return ""
-    # Portable 12-hour formatting without leading zero.
-    return dt.strftime("%I:%M %p").lstrip("0")
-
-
 def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
-    """
-    Query The Pond's two public Google Calendar ICS feeds directly and expand
-    recurring events for exactly the selected date.
+    page.goto(rink["url"], wait_until="domcontentloaded", timeout=45_000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=12_000)
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(4500)
 
-    Barn Time:
-        thebarnrinkcalendar@gmail.com
+    rows = scrape_all_scopes(page, rink, start, end)
 
-    Pond Time:
-        thepondcalendar@gmail.com
-    """
-    selected = start
-    rows = []
-
-    for cal in POND_GOOGLE_CALENDARS:
-        calendar_id = cal["calendar_id"]
-        session_name = cal["session"]
-
-        encoded_id = quote(calendar_id, safe="")
-        ics_url = (
-            "https://calendar.google.com/calendar/ical/"
-            f"{encoded_id}/public/basic.ics"
-        )
-
-        try:
-            response = page.request.get(ics_url, timeout=20_000)
-        except Exception as exc:
-            rows.append({
-                "date": selected.isoformat(),
-                "start": "",
-                "end": "",
-                "rink": "The Pond",
-                "session": "POND DEBUG",
-                "details": f"ICS REQUEST ERROR | {calendar_id} | {exc}",
-                "source": ics_url,
-            })
-            continue
-
-        if not response.ok:
-            rows.append({
-                "date": selected.isoformat(),
-                "start": "",
-                "end": "",
-                "rink": "The Pond",
-                "session": "POND DEBUG",
-                "details": (
-                    f"ICS HTTP {response.status} | {calendar_id} | {ics_url}"
-                ),
-                "source": ics_url,
-            })
-            continue
-
-        try:
-            events = _parse_ics_events(response.text())
-        except Exception as exc:
-            rows.append({
-                "date": selected.isoformat(),
-                "start": "",
-                "end": "",
-                "rink": "The Pond",
-                "session": "POND DEBUG",
-                "details": f"ICS PARSE ERROR | {calendar_id} | {exc}",
-                "source": ics_url,
-            })
-            continue
-
-        matched = 0
-
-        for event in events:
-            summary = norm(event.get("SUMMARY", ""))
-            if session_name.lower() not in summary.lower():
-                continue
-
-            for occurrence_start, occurrence_end in _expand_ics_event_for_date(
-                event, selected
-            ):
-                rows.append({
-                    "date": selected.isoformat(),
-                    "start": _format_clock(occurrence_start),
-                    "end": _format_clock(occurrence_end),
-                    "rink": "The Pond",
-                    "session": session_name,
-                    "details": (
-                        f"GOOGLE ICS | {calendar_id} | {summary} | "
-                        f"RRULE={event.get('RRULE', '')}"
-                    ),
-                    "source": ics_url,
-                })
-                matched += 1
-
-        if matched == 0:
-            # Keep a diagnostic row hidden from the public schedule so we can
-            # distinguish "feed accessible, no match" from "feed unavailable".
-            summaries = sorted({
-                norm(e.get("SUMMARY", ""))
-                for e in events
-                if e.get("SUMMARY")
-            })
-            interesting = [
-                s for s in summaries
-                if "barn" in s.lower() or "pond" in s.lower() or "time" in s.lower()
-            ][:20]
-
-            rows.append({
-                "date": selected.isoformat(),
-                "start": "",
-                "end": "",
-                "rink": "The Pond",
-                "session": "POND DEBUG",
-                "details": (
-                    f"ICS OK, 0 {session_name} occurrences on {selected} | "
-                    f"calendar={calendar_id} | "
-                    f"candidate summaries={interesting}"
-                ),
-                "source": ics_url,
-            })
-
-    # Strict de-dupe; Barn Time and Pond Time remain separate.
-    unique = []
-    seen = set()
+    # Keep only rows that appear to belong to the requested range when a date
+    # could be extracted. Undated rows remain visible so site markup changes
+    # don't silently hide valid sessions.
+    filtered = []
     for row in rows:
-        key = (
-            row["date"],
-            row["start"],
-            row["end"],
-            row["session"],
-            row["details"] if row["session"] == "POND DEBUG" else "",
-        )
-        if key not in seen:
-            seen.add(key)
-            unique.append(row)
-
-    return unique
+        if not row["date"]:
+            filtered.append(row)
+            continue
+        try:
+            d = date.fromisoformat(row["date"])
+            if start <= d <= end:
+                filtered.append(row)
+        except ValueError:
+            filtered.append(row)
+    return filtered
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1204,36 +713,35 @@ else:
     for rink in RINKS:
         rink_name = rink["rink"]
         rink_rows = sessions[sessions["rink"] == rink_name].copy()
-        public_rink_rows = rink_rows[rink_rows["session"] != "POND DEBUG"].copy()
 
         # Sort chronologically by start time (e.g. 9 AM before 12 PM before 4 PM).
-        if not public_rink_rows.empty:
-            public_rink_rows["_start_sort"] = pd.to_datetime(
-                public_rink_rows["start"], format="%I:%M %p", errors="coerce"
+        if not rink_rows.empty:
+            rink_rows["_start_sort"] = pd.to_datetime(
+                rink_rows["start"], format="%I:%M %p", errors="coerce"
             )
             # Also support times rendered without minutes, e.g. "9 AM".
-            missing_sort = public_rink_rows["_start_sort"].isna()
+            missing_sort = rink_rows["_start_sort"].isna()
             if missing_sort.any():
-                public_rink_rows.loc[missing_sort, "_start_sort"] = pd.to_datetime(
-                    public_rink_rows.loc[missing_sort, "start"],
+                rink_rows.loc[missing_sort, "_start_sort"] = pd.to_datetime(
+                    rink_rows.loc[missing_sort, "start"],
                     format="%I %p",
                     errors="coerce",
                 )
-            public_rink_rows = (
-                public_rink_rows.sort_values("_start_sort", na_position="last")
-                                .drop(columns="_start_sort")
+            rink_rows = (
+                rink_rows.sort_values("_start_sort", na_position="last")
+                         .drop(columns="_start_sort")
             )
 
         st.subheader(rink_name)
 
-        if public_rink_rows.empty:
+        if rink_rows.empty:
             st.caption("No matching sessions found.")
             continue
 
         # Only show schedule fields useful for verification.
         display_cols = ["start", "end", "session", "source"]
         st.dataframe(
-            public_rink_rows[display_cols],
+            rink_rows[display_cols],
             hide_index=True,
             use_container_width=True,
             column_config={
@@ -1246,18 +754,6 @@ else:
                 ),
             },
         )
-
-with st.expander("Pond feed debug"):
-    pond_debug = sessions[
-        (sessions["rink"] == "The Pond") &
-        (sessions["session"] == "POND DEBUG")
-    ] if not sessions.empty else sessions
-
-    if pond_debug.empty:
-        st.caption("No Pond feed error recorded.")
-    else:
-        for _, row in pond_debug.iterrows():
-            st.code(row["details"])
 
 with st.expander("Source diagnostics"):
     st.caption("Validation mode: Crossover is NETWORK-FIRST. Stick & Puck uses event_type=22; Private Hockey Coaches Ice uses event_type=13. Details begin with NETWORK JSON when the real DaySmart payload was used, or DOM FALLBACK otherwise.")
