@@ -623,6 +623,12 @@ def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
                             page, rink, start, 13, "Private Hockey Coaches Ice"
                         )
                     )
+                elif rink["rink"] == "Chaparral":
+                    rows.extend(
+                        scrape_crossover_filtered(
+                            page, rink, start, 12, "Hockey Stick and Puck"
+                        )
+                    )
                 elif rink["kind"] == "daysmart":
                     rows.extend(scrape_daysmart(page, rink, start, end))
                 else:
@@ -707,6 +713,24 @@ else:
     for rink in RINKS:
         rink_name = rink["rink"]
         rink_rows = sessions[sessions["rink"] == rink_name].copy()
+
+        # Sort chronologically by start time (e.g. 9 AM before 12 PM before 4 PM).
+        if not rink_rows.empty:
+            rink_rows["_start_sort"] = pd.to_datetime(
+                rink_rows["start"], format="%I:%M %p", errors="coerce"
+            )
+            # Also support times rendered without minutes, e.g. "9 AM".
+            missing_sort = rink_rows["_start_sort"].isna()
+            if missing_sort.any():
+                rink_rows.loc[missing_sort, "_start_sort"] = pd.to_datetime(
+                    rink_rows.loc[missing_sort, "start"],
+                    format="%I %p",
+                    errors="coerce",
+                )
+            rink_rows = (
+                rink_rows.sort_values("_start_sort", na_position="last")
+                         .drop(columns="_start_sort")
+            )
 
         st.subheader(rink_name)
 
