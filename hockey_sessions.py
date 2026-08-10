@@ -359,33 +359,22 @@ def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
 st.set_page_config(page_title="Austin Hockey Ice Finder", page_icon="🏒", layout="wide")
 st.title("🏒 Austin Hockey Ice Finder")
 st.caption(
-    "Crossover: Private Hockey Coaches Ice + Stick & Puck · "
-    "Chaparral: Hockey Stick and Puck · "
-    "The Pond: Barn Time + Pond Time"
+    "Single-day view · Crossover, Chaparral, and The Pond"
 )
 
 today = date.today()
 
-picked_dates = st.date_input(
-    "Dates",
-    value=(today, today + timedelta(days=2)),
-    help="Defaults to today plus the next two days. Choose any custom date range.",
+selected_date = st.date_input(
+    "Date",
+    value=today,
+    help="Choose one date to view sessions at all three rinks.",
 )
 
-# Streamlit returns a tuple/list for a range picker. While the user is choosing
-# the second date it can temporarily contain only one value.
-if isinstance(picked_dates, (tuple, list)):
-    start_date = picked_dates[0]
-    end_date = picked_dates[-1]
-else:
-    start_date = picked_dates
-    end_date = picked_dates
+start_date = selected_date
+end_date = selected_date
 
 refresh = st.button("Refresh schedules", type="primary")
 
-if end_date < start_date:
-    st.error("'Through' must be on or after 'From'.")
-    st.stop()
 
 if refresh:
     scrape_all.clear()
@@ -407,37 +396,48 @@ if not errors.empty:
         st.warning(f'{row["rink"]}: {row["details"]}')
 
 if sessions.empty:
-    st.info("No matching sessions found for the selected dates. Check the rink counters above; a zero can also mean that rink changed its embedded calendar markup.")
+    st.info("No matching sessions found for the selected date.")
 else:
-    rink_filter = st.multiselect(
-        "Rinks",
-        options=list(dict.fromkeys(sessions["rink"].tolist())),
-        default=list(dict.fromkeys(sessions["rink"].tolist())),
-    )
-    shown = sessions[sessions["rink"].isin(rink_filter)].copy()
+    # Show each rink separately so source accuracy is easy to verify.
+    for rink in RINKS:
+        rink_name = rink["rink"]
+        rink_rows = sessions[sessions["rink"] == rink_name].copy()
 
-    # Main one-page view.
-    st.dataframe(
-        shown[["date", "start", "end", "rink", "session", "details", "source"]],
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "date": "Date",
-            "start": "Start",
-            "end": "End",
-            "rink": "Rink",
-            "session": "Session",
-            "details": st.column_config.TextColumn("Details", width="large"),
-            "source": st.column_config.LinkColumn("Open calendar", display_text="Open"),
-        },
-    )
+        st.subheader(rink_name)
 
-    st.download_button(
-        "Download CSV",
-        shown.to_csv(index=False).encode("utf-8"),
-        file_name=f"hockey_sessions_{start_date}_{end_date}.csv",
-        mime="text/csv",
-    )
+        if rink_rows.empty:
+            st.caption("No matching sessions found.")
+            continue
+
+        # Only show schedule fields useful for verification.
+        display_cols = ["start", "end", "session", "source"]
+        st.dataframe(
+            rink_rows[display_cols],
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "start": "Start",
+                "end": "End",
+                "session": "Session",
+                "source": st.column_config.LinkColumn(
+                    "Official calendar",
+                    display_text="Open",
+                ),
+            },
+        )
+
+with st.expander("Source diagnostics"):
+    st.caption("Use this only while validating scraper accuracy.")
+    for rink in RINKS:
+        rink_name = rink["rink"]
+        rink_rows = sessions[sessions["rink"] == rink_name] if not sessions.empty else sessions
+        st.markdown(f"**{rink_name}: {len(rink_rows)} match(es)**")
+        if not rink_rows.empty:
+            for _, row in rink_rows.iterrows():
+                st.code(
+                    f'{row["date"]} | {row["start"]} - {row["end"]} | '
+                    f'{row["session"]}\n{row["details"]}'
+                )
 
 with st.expander("Troubleshooting"):
     st.markdown(
