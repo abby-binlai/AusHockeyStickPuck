@@ -26,7 +26,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 RINKS = [
     {
-        "rink": rink["rink"],
+        "rink": "Crossover",
         "kind": "daysmart",
         "url": "https://apps.daysmartrecreation.com/dash/x/iceandfield/calendar",
         "wanted": ["private hockey coaches ice", "stick & puck"],
