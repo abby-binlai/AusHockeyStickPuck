@@ -28,8 +28,6 @@ import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
-APP_VERSION = "pond-direct-ics-v1"
-
 RINKS = [
     {
         "rink": "Crossover",
@@ -1006,9 +1004,8 @@ def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
 
 st.set_page_config(page_title="Austin Hockey Ice Finder", page_icon="🏒", layout="wide")
 st.title("🏒 Austin Hockey Ice Finder")
-st.caption(f"Build: {APP_VERSION}")
 st.caption(
-    "Single-day view · Crossover, Chaparral, and The Pond"
+    "Crossover · Chaparral · The Pond"
 )
 
 today = date.today()
@@ -1033,11 +1030,13 @@ with st.spinner("Loading rink calendars…"):
 
 errors = df[df["session"] == "SCRAPE ERROR"] if not df.empty else pd.DataFrame()
 sessions = df[df["session"] != "SCRAPE ERROR"].copy() if not df.empty else df
+if not sessions.empty:
+    sessions = sessions[sessions["session"] != "POND DEBUG"].copy()
 
 # Always show the three configured sources and how many matches were found.
 status_cols = st.columns(3)
 for col, rink in zip(status_cols, RINKS):
-    count = 0 if sessions.empty else int((sessions["rink"] == rink["rink"]).sum())
+    count = 0 if sessions.empty else int(((sessions["rink"] == rink["rink"]) & (sessions["session"] != "POND DEBUG")).sum())
     col.metric(rink["rink"], f"{count} session" + ("" if count == 1 else "s"))
 
 if not errors.empty:
@@ -1051,7 +1050,7 @@ else:
     for rink in RINKS:
         rink_name = rink["rink"]
         rink_rows = sessions[sessions["rink"] == rink_name].copy()
-        public_rink_rows = rink_rows[rink_rows["session"] != "POND DEBUG"].copy()
+        public_rink_rows = rink_rows.copy()
 
         # Sort chronologically by start time (e.g. 9 AM before 12 PM before 4 PM).
         if not public_rink_rows.empty:
@@ -1094,40 +1093,3 @@ else:
             },
         )
 
-with st.expander("Pond feed debug"):
-    pond_debug = sessions[
-        (sessions["rink"] == "The Pond") &
-        (sessions["session"] == "POND DEBUG")
-    ] if not sessions.empty else sessions
-
-    if pond_debug.empty:
-        st.caption("No Pond feed error recorded.")
-    else:
-        for _, row in pond_debug.iterrows():
-            st.code(row["details"])
-
-with st.expander("Source diagnostics"):
-    st.caption("Validation mode: Crossover is NETWORK-FIRST. Stick & Puck uses event_type=22; Private Hockey Coaches Ice uses event_type=13. Details begin with NETWORK JSON when the real DaySmart payload was used, or DOM FALLBACK otherwise.")
-    for rink in RINKS:
-        rink_name = rink["rink"]
-        rink_rows = sessions[sessions["rink"] == rink_name] if not sessions.empty else sessions
-        st.markdown(f"**{rink_name}: {len(rink_rows)} match(es)**")
-        if not rink_rows.empty:
-            for _, row in rink_rows.iterrows():
-                st.code(
-                    f'{row["date"]} | {row["start"]} - {row["end"]} | '
-                    f'{row["session"]}\n{row["details"]}'
-                )
-
-with st.expander("Troubleshooting"):
-    st.markdown(
-        """
-If one rink suddenly stops showing sessions, the site probably changed its
-calendar markup. Run the scraper with `headless=False` in `browser =
-p.chromium.launch(...)` and inspect the rendered event elements.
-
-For Crossover, the scraper first captures DaySmart XHR/fetch/JSON responses and
-parses event timestamps directly. DOM scraping is only a fallback. In Source
-diagnostics, a correct network-derived row starts with `NETWORK JSON`.
-"""
-    )
