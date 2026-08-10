@@ -810,45 +810,84 @@ def _google_calendar_embed_url(calendar_id: str, selected: date) -> str:
     return f"https://calendar.google.com/calendar/u/0/newembed?{params}"
 
 
+def _parse_google_agenda_date(line: str, selected_year: int) -> date | None:
+    s = norm(line).upper().replace("|", " ")
+    months = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
+        "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
+        "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+    }
+
+    m = re.search(r"\b(\d{1,2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b", s)
+    if m:
+        try:
+            return date(selected_year, months[m.group(2)], int(m.group(1)))
+        except ValueError:
+            return None
+
+    m = re.search(r"\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{1,2})\b", s)
+    if m:
+        try:
+            return date(selected_year, months[m.group(1)], int(m.group(2)))
+        except ValueError:
+            return None
+
+    return None
+
+
+def _parse_google_time_range(text: str) -> tuple[str, str]:
+    s = norm(text)
+
+    m = re.search(
+        r"\b(\d{1,2}(?::\d{2})?)\s*(am|pm)?\s*[-–—]\s*"
+        r"(\d{1,2}(?::\d{2})?)\s*(am|pm)\b",
+        s,
+        re.I,
+    )
+    if m:
+        start_suffix = (m.group(2) or m.group(4)).upper()
+        return f"{m.group(1)} {start_suffix}", f"{m.group(3)} {m.group(4).upper()}"
+
+    m = re.search(
+        r"\b(\d{1,2}(?::\d{2})?)\s*(am|pm)\s*[-–—]\s*"
+        r"(\d{1,2}(?::\d{2})?)\s*(am|pm)?\b",
+        s,
+        re.I,
+    )
+    if m:
+        end_suffix = (m.group(4) or m.group(2)).upper()
+        return f"{m.group(1)} {m.group(2).upper()}", f"{m.group(3)} {end_suffix}"
+
+    return times_from_text(s)
+
+
 def _parse_single_pond_calendar(
     body_text: str,
     selected: date,
     session_name: str,
     source_url: str,
 ) -> list[dict]:
-    """
-    Parse one isolated Google Calendar agenda.
-
-    Because each browser page contains only one known source calendar, the
-    parser only accepts rows containing the expected session name.
-    """
     raw_lines = re.split(r"[\r\n]+", body_text or "")
     lines = [norm(x) for x in raw_lines if norm(x)]
 
     rows = []
     seen = set()
+    current_date = None
 
     for i, line in enumerate(lines):
+        heading = _parse_google_agenda_date(line, selected.year)
+        if heading:
+            current_date = heading
+            continue
+
         if session_name.lower() not in line.lower():
             continue
 
-        lo = max(0, i - 3)
-        hi = min(len(lines), i + 4)
-        context = " | ".join(lines[lo:hi])
+        if current_date != selected:
+            continue
 
-        # Try a direct time range first.
-        m = re.search(
-            r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM))\s*[-–—]\s*"
-            r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM))",
-            context,
-            re.I,
-        )
-
-        if m:
-            start_time = norm(m.group(1)).upper()
-            end_time = norm(m.group(2)).upper()
-        else:
-            start_time, end_time = times_from_text(context)
+        context = " | ".join(lines[max(0, i - 3):min(len(lines), i + 4)])
+        start_time, end_time = _parse_google_time_range(context)
 
         if not start_time:
             continue
@@ -864,7 +903,7 @@ def _parse_single_pond_calendar(
             "end": end_time,
             "rink": "The Pond",
             "session": session_name,
-            "details": f"GOOGLE CALENDAR DIRECT | {context}",
+            "details": f"GOOGLE CALENDAR DIRECT | date={selected.isoformat()} | {context}",
             "source": source_url,
         })
 
