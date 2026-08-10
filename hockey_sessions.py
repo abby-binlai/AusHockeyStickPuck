@@ -26,7 +26,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 RINKS = [
     {
-        "rink": "Crossover",
+        "rink": rink["rink"],
         "kind": "daysmart",
         "url": "https://apps.daysmartrecreation.com/dash/x/iceandfield/calendar",
         "wanted": ["private hockey coaches ice", "stick & puck"],
@@ -458,7 +458,7 @@ def capture_daysmart_json_events(page, url: str, selected: date,
     return unique, list(dict.fromkeys(diagnostics))
 
 
-def scrape_crossover_filtered(page, rink: dict, selected: date,
+def scrape_daysmart_filtered(page, rink: dict, selected: date,
                               event_type: int, session_name: str) -> list[dict]:
     """
     Network-first Crossover scraper.
@@ -588,7 +588,7 @@ def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
     return filtered
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
     start = date.fromisoformat(start_iso)
     end = date.fromisoformat(end_iso)
@@ -614,18 +614,18 @@ def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
                     # Use DaySmart's explicit event-type filters for both
                     # Crossover session categories.
                     rows.extend(
-                        scrape_crossover_filtered(
+                        scrape_daysmart_filtered(
                             page, rink, start, 22, "Stick & Puck"
                         )
                     )
                     rows.extend(
-                        scrape_crossover_filtered(
+                        scrape_daysmart_filtered(
                             page, rink, start, 13, "Private Hockey Coaches Ice"
                         )
                     )
                 elif rink["rink"] == "Chaparral":
                     rows.extend(
-                        scrape_crossover_filtered(
+                        scrape_daysmart_filtered(
                             page, rink, start, 12, "Hockey Stick and Puck"
                         )
                     )
