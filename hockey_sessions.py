@@ -14,6 +14,7 @@ Run:
 from __future__ import annotations
 
 import re
+import base64
 import html as htmlmod
 import json
 from datetime import date, datetime, timedelta, timezone
@@ -765,100 +766,132 @@ def _pond_event_rows_from_text(
     return rows
 
 
-def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
+POND_GOOGLE_CALENDARS = [
+    {
+        "calendar_id": "thebarnrinkcalendar@gmail.com",
+        "session": "Barn Time",
+    },
+    {
+        "calendar_id": "thepondcalendar@gmail.com",
+        "session": "Pond Time",
+    },
+]
+
+
+def _google_calendar_embed_url(calendar_id: str, selected: date) -> str:
     """
-    Scrape The Pond's two embedded Google Calendars.
+    Build a one-calendar Google Calendar agenda URL for exactly one selected day.
 
-    Important: do NOT use the ICS feed here. The calendars can contain recurring
-    events, and the raw ICS recurrence rules do not necessarily equal the
-    expanded occurrences visible on a selected day.
-
-    Instead:
-    1. Open The Pond schedule page.
-    2. Find its Google Calendar iframe URLs.
-    3. Re-open each calendar in Google Agenda mode constrained to the selected
-       date, letting Google expand recurring events.
-    4. Extract only exact "Barn Time" and "Pond Time" occurrences.
+    Google newembed accepts the calendar ID as URL-safe base64 in `src`.
     """
-    selected = start
+    encoded_src = base64.urlsafe_b64encode(
+        calendar_id.encode("utf-8")
+    ).decode("ascii").rstrip("=")
 
-    page.goto(rink["url"], wait_until="domcontentloaded", timeout=45_000)
-    try:
-        page.wait_for_load_state("networkidle", timeout=12_000)
-    except PlaywrightTimeoutError:
-        pass
-    page.wait_for_timeout(3000)
+    ymd = selected.strftime("%Y%m%d")
 
-    embed_urls = []
+    params = urlencode({
+        "height": 700,
+        "wkst": 1,
+        "bgcolor": "#ffffff",
+        "ctz": "America/Chicago",
+        "mode": "AGENDA",
+        "dates": f"{ymd}/{ymd}",
+        "showTitle": 0,
+        "showNav": 0,
+        "showDate": 1,
+        "showPrint": 0,
+        "showTabs": 0,
+        "showCalendars": 0,
+        "showTz": 0,
+        "src": encoded_src,
+    })
 
-    def add_google_url(candidate: str):
-        if not candidate:
-            return
-        candidate = htmlmod.unescape(candidate).replace("\\u0026", "&")
-        if candidate.startswith("//"):
-            candidate = "https:" + candidate
-        if "calendar.google.com" in candidate.lower() and candidate not in embed_urls:
-            embed_urls.append(candidate)
+    return f"https://calendar.google.com/calendar/u/0/newembed?{params}"
 
-    # 1) Normal and lazy-loaded iframe attributes.
-    try:
-        iframes = page.locator("iframe")
-        count = min(iframes.count(), 200)
-        for i in range(count):
-            node = iframes.nth(i)
-            for attr in (
-                "src",
-                "data-src",
-                "data-lazy-src",
-                "data-original",
-                "data-url",
-            ):
-                try:
-                    add_google_url(node.get_attribute(attr) or "")
-                except Exception:
-                    continue
-    except Exception:
-        pass
 
-    # 2) Playwright's actual frame URLs. This catches iframes whose src was
-    # injected by JavaScript after page load.
-    try:
-        for frame in page.frames:
-            add_google_url(frame.url)
-    except Exception:
-        pass
+def _parse_single_pond_calendar(
+    body_text: str,
+    selected: date,
+    session_name: str,
+    source_url: str,
+) -> list[dict]:
+    """
+    Parse one isolated Google Calendar agenda.
 
-    # 3) Search the rendered DOM HTML for Google Calendar URLs stored inside
-    # scripts/data attributes rather than a conventional iframe src.
-    try:
-        markup = page.content()
-        markup = htmlmod.unescape(markup)
-        patterns = [
-            r'https?://calendar\.google\.com/calendar/embed\?[^"\'<> ]+',
-            r'//calendar\.google\.com/calendar/embed\?[^"\'<> ]+',
-        ]
-        for pattern in patterns:
-            for found in re.findall(pattern, markup, flags=re.I):
-                add_google_url(found)
-    except Exception:
-        pass
+    Because each browser page contains only one known source calendar, the
+    parser only accepts rows containing the expected session name.
+    """
+    raw_lines = re.split(r"[\r\n]+", body_text or "")
+    lines = [norm(x) for x in raw_lines if norm(x)]
 
     rows = []
+    seen = set()
 
-    if not embed_urls:
-        return [{
+    for i, line in enumerate(lines):
+        if session_name.lower() not in line.lower():
+            continue
+
+        lo = max(0, i - 3)
+        hi = min(len(lines), i + 4)
+        context = " | ".join(lines[lo:hi])
+
+        # Try a direct time range first.
+        m = re.search(
+            r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM))\s*[-–—]\s*"
+            r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM))",
+            context,
+            re.I,
+        )
+
+        if m:
+            start_time = norm(m.group(1)).upper()
+            end_time = norm(m.group(2)).upper()
+        else:
+            start_time, end_time = times_from_text(context)
+
+        if not start_time:
+            continue
+
+        key = (selected.isoformat(), start_time, end_time, session_name)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rows.append({
             "date": selected.isoformat(),
-            "start": "",
-            "end": "",
+            "start": start_time,
+            "end": end_time,
             "rink": "The Pond",
-            "session": "SCRAPE ERROR",
-            "details": "POND DEBUG: no Google Calendar embed URL discovered from iframe attrs, live frames, or page HTML",
-            "source": rink["url"],
-        }]
+            "session": session_name,
+            "details": f"GOOGLE CALENDAR DIRECT | {context}",
+            "source": source_url,
+        })
 
-    # Open each Google Calendar separately so the rendered text is isolated.
-    for embed_src in embed_urls:
-        agenda_url = _google_embed_for_date(embed_src, selected)
+    return rows
+
+
+def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
+    """
+    Query The Pond's two Google Calendars directly.
+
+    Barn Time:
+        thebarnrinkcalendar@gmail.com
+
+    Pond Time:
+        thepondcalendar@gmail.com
+
+    This completely bypasses the SportsEngine/Pond schedule page and its
+    iframe/lazy-load behavior.
+    """
+    selected = start
+    rows = []
+
+    for cal in POND_GOOGLE_CALENDARS:
+        calendar_id = cal["calendar_id"]
+        session_name = cal["session"]
+        agenda_url = _google_calendar_embed_url(calendar_id, selected)
+
         cal_page = page.context.new_page()
         try:
             cal_page.goto(
@@ -866,52 +899,61 @@ def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
                 wait_until="domcontentloaded",
                 timeout=45_000,
             )
+
             try:
                 cal_page.wait_for_load_state("networkidle", timeout=12_000)
             except PlaywrightTimeoutError:
                 pass
-            cal_page.wait_for_timeout(2500)
 
-            # Main Google document first.
+            cal_page.wait_for_timeout(3000)
+
+            bodies = []
+
             try:
-                body = cal_page.locator("body").inner_text(timeout=7000)
-                rows.extend(
-                    _pond_event_rows_from_text(body, selected, agenda_url)
+                bodies.append(
+                    cal_page.locator("body").inner_text(timeout=7000)
                 )
             except Exception:
                 pass
 
-            # Also inspect child frames in case Google nests rendered content.
             for frame in cal_page.frames:
                 if frame == cal_page.main_frame:
                     continue
                 try:
-                    body = frame.locator("body").inner_text(timeout=5000)
-                    rows.extend(
-                        _pond_event_rows_from_text(body, selected, agenda_url)
+                    bodies.append(
+                        frame.locator("body").inner_text(timeout=5000)
                     )
                 except Exception:
                     continue
+
+            cal_rows = []
+            for body in bodies:
+                cal_rows.extend(
+                    _parse_single_pond_calendar(
+                        body,
+                        selected,
+                        session_name,
+                        agenda_url,
+                    )
+                )
+
+            # De-dupe identical event occurrences from overlapping frame text.
+            seen = set()
+            for row in cal_rows:
+                key = (
+                    row["date"],
+                    row["start"],
+                    row["end"],
+                    row["session"],
+                )
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(row)
+
         finally:
             cal_page.close()
 
-    # Strict de-duplication. The same event can appear in both main document
-    # and child frame, but Barn Time and Pond Time at the same clock time are
-    # intentionally separate because session name is part of the key.
-    unique = []
-    seen = set()
-    for row in rows:
-        key = (
-            row["date"],
-            row["start"],
-            row["end"],
-            row["session"],
-        )
-        if key not in seen:
-            seen.add(key)
-            unique.append(row)
-
-    return unique
+    return rows
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1039,35 +1081,36 @@ else:
     for rink in RINKS:
         rink_name = rink["rink"]
         rink_rows = sessions[sessions["rink"] == rink_name].copy()
+        public_rink_rows = rink_rows[rink_rows["session"] != "POND DEBUG"].copy()
 
         # Sort chronologically by start time (e.g. 9 AM before 12 PM before 4 PM).
-        if not rink_rows.empty:
-            rink_rows["_start_sort"] = pd.to_datetime(
-                rink_rows["start"], format="%I:%M %p", errors="coerce"
+        if not public_rink_rows.empty:
+            public_rink_rows["_start_sort"] = pd.to_datetime(
+                public_rink_rows["start"], format="%I:%M %p", errors="coerce"
             )
             # Also support times rendered without minutes, e.g. "9 AM".
-            missing_sort = rink_rows["_start_sort"].isna()
+            missing_sort = public_rink_rows["_start_sort"].isna()
             if missing_sort.any():
-                rink_rows.loc[missing_sort, "_start_sort"] = pd.to_datetime(
-                    rink_rows.loc[missing_sort, "start"],
+                public_rink_rows.loc[missing_sort, "_start_sort"] = pd.to_datetime(
+                    public_rink_rows.loc[missing_sort, "start"],
                     format="%I %p",
                     errors="coerce",
                 )
-            rink_rows = (
-                rink_rows.sort_values("_start_sort", na_position="last")
-                         .drop(columns="_start_sort")
+            public_rink_rows = (
+                public_rink_rows.sort_values("_start_sort", na_position="last")
+                                .drop(columns="_start_sort")
             )
 
         st.subheader(rink_name)
 
-        if rink_rows.empty:
+        if public_rink_rows.empty:
             st.caption("No matching sessions found.")
             continue
 
         # Only show schedule fields useful for verification.
         display_cols = ["start", "end", "session", "source"]
         st.dataframe(
-            rink_rows[display_cols],
+            public_rink_rows[display_cols],
             hide_index=True,
             use_container_width=True,
             column_config={
