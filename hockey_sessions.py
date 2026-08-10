@@ -14,6 +14,7 @@ Run:
 from __future__ import annotations
 
 import re
+import html as htmlmod
 import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
@@ -789,20 +790,71 @@ def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
     page.wait_for_timeout(3000)
 
     embed_urls = []
+
+    def add_google_url(candidate: str):
+        if not candidate:
+            return
+        candidate = htmlmod.unescape(candidate).replace("\\u0026", "&")
+        if candidate.startswith("//"):
+            candidate = "https:" + candidate
+        if "calendar.google.com" in candidate.lower() and candidate not in embed_urls:
+            embed_urls.append(candidate)
+
+    # 1) Normal and lazy-loaded iframe attributes.
     try:
         iframes = page.locator("iframe")
-        count = min(iframes.count(), 100)
+        count = min(iframes.count(), 200)
         for i in range(count):
-            try:
-                src = iframes.nth(i).get_attribute("src") or ""
-            except Exception:
-                continue
-            if "calendar.google.com" in src.lower() and src not in embed_urls:
-                embed_urls.append(src)
+            node = iframes.nth(i)
+            for attr in (
+                "src",
+                "data-src",
+                "data-lazy-src",
+                "data-original",
+                "data-url",
+            ):
+                try:
+                    add_google_url(node.get_attribute(attr) or "")
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 2) Playwright's actual frame URLs. This catches iframes whose src was
+    # injected by JavaScript after page load.
+    try:
+        for frame in page.frames:
+            add_google_url(frame.url)
+    except Exception:
+        pass
+
+    # 3) Search the rendered DOM HTML for Google Calendar URLs stored inside
+    # scripts/data attributes rather than a conventional iframe src.
+    try:
+        markup = page.content()
+        markup = htmlmod.unescape(markup)
+        patterns = [
+            r'https?://calendar\.google\.com/calendar/embed\?[^"\'<> ]+',
+            r'//calendar\.google\.com/calendar/embed\?[^"\'<> ]+',
+        ]
+        for pattern in patterns:
+            for found in re.findall(pattern, markup, flags=re.I):
+                add_google_url(found)
     except Exception:
         pass
 
     rows = []
+
+    if not embed_urls:
+        return [{
+            "date": selected.isoformat(),
+            "start": "",
+            "end": "",
+            "rink": "The Pond",
+            "session": "SCRAPE ERROR",
+            "details": "POND DEBUG: no Google Calendar embed URL discovered from iframe attrs, live frames, or page HTML",
+            "source": rink["url"],
+        }]
 
     # Open each Google Calendar separately so the rendered text is isolated.
     for embed_src in embed_urls:
