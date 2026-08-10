@@ -923,7 +923,7 @@ def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
     return unique
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=14400, show_spinner=False)
 def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
     start = date.fromisoformat(start_iso)
     end = date.fromisoformat(end_iso)
