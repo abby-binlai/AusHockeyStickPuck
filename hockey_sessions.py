@@ -867,45 +867,74 @@ def _parse_single_pond_calendar(
     session_name: str,
     source_url: str,
 ) -> list[dict]:
+    """
+    Parse one isolated Google Calendar agenda by first locating the selected
+    date block, then scanning only that block for the requested session.
+
+    This is safer than maintaining a rolling current_date because Google's
+    rendered agenda text can omit/reorder headings depending on viewport.
+    """
     raw_lines = re.split(r"[\r\n]+", body_text or "")
     lines = [norm(x) for x in raw_lines if norm(x)]
 
+    # Locate every agenda date heading.
+    headings = []
+    for i, line in enumerate(lines):
+        d = _parse_google_agenda_date(line, selected.year)
+        if d:
+            headings.append((i, d))
+
+    # Build candidate slices for the selected date only.
+    selected_slices = []
+    for idx, (line_i, d) in enumerate(headings):
+        if d != selected:
+            continue
+        next_i = headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
+        selected_slices.append(lines[line_i:next_i])
+
+    # Some Google renders can put the date as separate adjacent tokens instead
+    # of one heading line. Fallback to the whole body only if it contains a
+    # strong selected-date token.
+    if not selected_slices:
+        mon = selected.strftime("%b").upper()
+        day = str(selected.day)
+        strong_date = any(
+            re.search(rf"\b{re.escape(day)}\b.*\b{mon}\b|\b{mon}\b.*\b{re.escape(day)}\b", line.upper())
+            for line in lines
+        )
+        if strong_date:
+            selected_slices = [lines]
+
     rows = []
     seen = set()
-    current_date = None
 
-    for i, line in enumerate(lines):
-        heading = _parse_google_agenda_date(line, selected.year)
-        if heading:
-            current_date = heading
-            continue
+    for block in selected_slices:
+        for i, line in enumerate(block):
+            if session_name.lower() not in line.lower():
+                continue
 
-        if session_name.lower() not in line.lower():
-            continue
+            # Prefer the immediately preceding lines because Google agenda puts
+            # the time before the event title.
+            context = " | ".join(block[max(0, i - 4):min(len(block), i + 3)])
+            start_time, end_time = _parse_google_time_range(context)
 
-        if current_date != selected:
-            continue
+            if not start_time:
+                continue
 
-        context = " | ".join(lines[max(0, i - 3):min(len(lines), i + 4)])
-        start_time, end_time = _parse_google_time_range(context)
+            key = (selected.isoformat(), start_time, end_time, session_name)
+            if key in seen:
+                continue
+            seen.add(key)
 
-        if not start_time:
-            continue
-
-        key = (selected.isoformat(), start_time, end_time, session_name)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        rows.append({
-            "date": selected.isoformat(),
-            "start": start_time,
-            "end": end_time,
-            "rink": "The Pond",
-            "session": session_name,
-            "details": f"GOOGLE CALENDAR DIRECT | date={selected.isoformat()} | {context}",
-            "source": source_url,
-        })
+            rows.append({
+                "date": selected.isoformat(),
+                "start": start_time,
+                "end": end_time,
+                "rink": "The Pond",
+                "session": session_name,
+                "details": f"GOOGLE CALENDAR DIRECT | selected={selected.isoformat()} | {context}",
+                "source": source_url,
+            })
 
     return rows
 
