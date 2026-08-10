@@ -1002,6 +1002,28 @@ def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
     return df
 
 
+
+def official_calendar_link(rink_name: str, selected: date) -> str:
+    d = selected.isoformat()
+
+    if rink_name == "Crossover":
+        return (
+            "https://apps.daysmartrecreation.com/dash/x/iceandfield/calendar"
+            f"?start={d}&end={d}"
+        )
+
+    if rink_name == "Chaparral":
+        return (
+            "https://apps.daysmartrecreation.com/dash/x/chaparralice/calendar"
+            f"?start={d}&end={d}"
+        )
+
+    if rink_name == "The Pond":
+        return "https://www.pondhockeyclub.com/page/show/2723404-rink-schedules"
+
+    return ""
+
+
 st.set_page_config(page_title="Austin Hockey Ice Finder", page_icon="🏒", layout="wide")
 st.title("🏒 Austin Hockey Ice Finder")
 st.caption(
@@ -1051,6 +1073,11 @@ else:
         rink_name = rink["rink"]
         rink_rows = sessions[sessions["rink"] == rink_name].copy()
         public_rink_rows = rink_rows.copy()
+
+        if not public_rink_rows.empty:
+            public_rink_rows["source"] = official_calendar_link(
+                rink_name, selected_date
+            )
 
         # Sort chronologically by start time (e.g. 9 AM before 12 PM before 4 PM).
         if not public_rink_rows.empty:
