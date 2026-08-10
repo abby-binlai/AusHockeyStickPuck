@@ -788,7 +788,8 @@ def _google_calendar_embed_url(calendar_id: str, selected: date) -> str:
         calendar_id.encode("utf-8")
     ).decode("ascii").rstrip("=")
 
-    ymd = selected.strftime("%Y%m%d")
+    start_ymd = selected.strftime("%Y%m%d")
+    end_ymd = (selected + timedelta(days=1)).strftime("%Y%m%d")
 
     params = urlencode({
         "height": 700,
@@ -796,7 +797,9 @@ def _google_calendar_embed_url(calendar_id: str, selected: date) -> str:
         "bgcolor": "#ffffff",
         "ctz": "America/Chicago",
         "mode": "AGENDA",
-        "dates": f"{ymd}/{ymd}",
+        # Google Calendar treats the second date as the exclusive range end.
+        # For one selected day, use selected -> next day, not selected -> selected.
+        "dates": f"{start_ymd}/{end_ymd}",
         "showTitle": 0,
         "showNav": 0,
         "showDate": 1,
