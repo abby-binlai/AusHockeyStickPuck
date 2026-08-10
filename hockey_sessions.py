@@ -101,11 +101,12 @@ def clean_title(text: str, wanted: Iterable[str]) -> str:
     return norm(text)[:120]
 
 
-def scrape_rendered_events(page, rink: dict, start: date, end: date) -> list[dict]:
+def scrape_rendered_events(scope, rink: dict, start: date, end: date) -> list[dict]:
     """
-    Scrape likely calendar event nodes first, then fall back to rendered text blocks.
-    This intentionally uses several common calendar selectors so small front-end
-    changes are less likely to break the scraper.
+    Scrape likely event nodes, then fall back to rendered text lines.
+
+    `scope` may be a Playwright Page or Frame. This matters for sites such as
+    The Pond, where the actual schedule can be embedded in an iframe.
     """
     selectors = [
         ".fc-event",
@@ -114,24 +115,56 @@ def scrape_rendered_events(page, rink: dict, start: date, end: date) -> list[dic
         "[data-event-id]",
         "[class*='calendar'] a",
         "[class*='event']",
+        "[role='button']",
         "a",
     ]
 
     seen = set()
     rows = []
 
+    def add_row(text: str, context: str, href: str = ""):
+        text = norm(text)
+        context = norm(context)
+        if not text or not contains_wanted(text, rink["wanted"]):
+            return
+
+        event_date = date_from_text(context, start.year)
+        start_time, end_time = times_from_text(context)
+        key = (
+            rink["rink"],
+            event_date or "",
+            start_time,
+            end_time,
+            clean_title(text, rink["wanted"]).lower(),
+            context.lower(),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+
+        rows.append({
+            "date": event_date or "",
+            "start": start_time,
+            "end": end_time,
+            "rink": rink["rink"],
+            "session": clean_title(text, rink["wanted"]).title(),
+            "details": context,
+            "source": href or getattr(scope, "url", rink["url"]),
+        })
+
+    # First try actual event-like DOM nodes.
     for selector in selectors:
         try:
-            nodes = page.locator(selector)
-            count = min(nodes.count(), 1500)
+            nodes = scope.locator(selector)
+            count = min(nodes.count(), 1800)
         except Exception:
             continue
 
         for i in range(count):
             try:
                 node = nodes.nth(i)
-                text = norm(node.inner_text(timeout=500))
-                if not text or not contains_wanted(text, rink["wanted"]):
+                node_text = norm(node.inner_text(timeout=600))
+                if not node_text or not contains_wanted(node_text, rink["wanted"]):
                     continue
 
                 href = ""
@@ -140,60 +173,85 @@ def scrape_rendered_events(page, rink: dict, start: date, end: date) -> list[dic
                 except Exception:
                     pass
 
-                # Include parent context because calendar tiles often put the
-                # date/time in a parent/sibling instead of the title element.
-                context = text
-                try:
-                    parent_text = norm(node.locator("xpath=..").inner_text(timeout=500))
-                    if len(parent_text) <= 700:
-                        context = parent_text
-                except Exception:
-                    pass
+                # Calendar libraries often put date/time one or two levels up.
+                contexts = [node_text]
+                for xpath in ("..", "../.."):
+                    try:
+                        parent_text = norm(
+                            node.locator(f"xpath={xpath}").inner_text(timeout=600)
+                        )
+                        if parent_text and len(parent_text) <= 1200:
+                            contexts.append(parent_text)
+                    except Exception:
+                        pass
 
-                event_date = date_from_text(context, start.year)
-                start_time, end_time = times_from_text(context)
-
-                key = (rink["rink"], event_date, start_time, end_time, text.lower())
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                rows.append({
-                    "date": event_date or "",
-                    "start": start_time,
-                    "end": end_time,
-                    "rink": rink["rink"],
-                    "session": clean_title(text, rink["wanted"]).title(),
-                    "details": context,
-                    "source": href or page.url,
-                })
+                # Prefer the richest nearby context.
+                context = max(contexts, key=len)
+                add_row(node_text, context, href)
             except Exception:
                 continue
 
-    # Last fallback: scan short rendered lines containing target names.
-    if not rows:
-        body = norm(page.locator("body").inner_text(timeout=5000))
-        chunks = re.split(r"[\n\r]+", body)
-        for chunk in chunks:
-            chunk = norm(chunk)
-            if 3 <= len(chunk) <= 500 and contains_wanted(chunk, rink["wanted"]):
-                event_date = date_from_text(chunk, start.year)
-                start_time, end_time = times_from_text(chunk)
-                key = (rink["rink"], event_date, start_time, end_time, chunk.lower())
-                if key not in seen:
-                    seen.add(key)
-                    rows.append({
-                        "date": event_date or "",
-                        "start": start_time,
-                        "end": end_time,
-                        "rink": rink["rink"],
-                        "session": clean_title(chunk, rink["wanted"]).title(),
-                        "details": chunk,
-                        "source": page.url,
-                    })
+    # Robust fallback. IMPORTANT: split the raw body into lines BEFORE
+    # whitespace normalization. The original scraper normalized first, which
+    # removed the line breaks and could hide valid Chaparral sessions.
+    try:
+        raw_body = scope.locator("body").inner_text(timeout=7000)
+    except Exception:
+        raw_body = ""
+
+    if raw_body:
+        raw_lines = [norm(x) for x in re.split(r"[\r\n]+", raw_body)]
+        lines = [x for x in raw_lines if x]
+
+        for i, line in enumerate(lines):
+            if not contains_wanted(line, rink["wanted"]):
+                continue
+
+            # Include nearby lines so headings/date/time around an event title
+            # become part of the same candidate record.
+            lo = max(0, i - 4)
+            hi = min(len(lines), i + 5)
+            context = " | ".join(lines[lo:hi])
+            if len(context) > 1600:
+                context = context[:1600]
+
+            add_row(line, context)
 
     return rows
 
+
+def scrape_all_scopes(page, rink: dict, start: date, end: date) -> list[dict]:
+    """Search the main document plus every accessible iframe."""
+    rows = []
+    scopes = [page]
+
+    # Playwright exposes cross-origin iframe contents through Frame objects.
+    for frame in page.frames:
+        if frame != page.main_frame:
+            scopes.append(frame)
+
+    for scope in scopes:
+        try:
+            rows.extend(scrape_rendered_events(scope, rink, start, end))
+        except Exception:
+            continue
+
+    # De-duplicate rows collected from overlapping page/frame scopes.
+    unique = []
+    seen = set()
+    for row in rows:
+        key = (
+            row["date"],
+            row["start"],
+            row["end"],
+            row["rink"],
+            row["session"].lower(),
+            row["details"].lower(),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    return unique
 
 def scrape_daysmart(page, rink: dict, start: date, end: date) -> list[dict]:
     # DaySmart accepts start/end query params on calendar URLs.
@@ -206,9 +264,9 @@ def scrape_daysmart(page, rink: dict, start: date, end: date) -> list[dict]:
         page.wait_for_load_state("networkidle", timeout=12_000)
     except PlaywrightTimeoutError:
         pass
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(3500)
 
-    return scrape_rendered_events(page, rink, start, end)
+    return scrape_all_scopes(page, rink, start, end)
 
 
 def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
@@ -217,9 +275,9 @@ def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
         page.wait_for_load_state("networkidle", timeout=12_000)
     except PlaywrightTimeoutError:
         pass
-    page.wait_for_timeout(3000)
+    page.wait_for_timeout(4500)
 
-    rows = scrape_rendered_events(page, rink, start, end)
+    rows = scrape_all_scopes(page, rink, start, end)
 
     # Keep only rows that appear to belong to the requested range when a date
     # could be extracted. Undated rows remain visible so site markup changes
@@ -307,15 +365,23 @@ st.caption(
 )
 
 today = date.today()
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    start_date = st.date_input("From", value=today)
-with c2:
-    end_date = st.date_input("Through", value=today + timedelta(days=7))
-with c3:
-    st.write("")
-    st.write("")
-    refresh = st.button("Refresh schedules", type="primary", use_container_width=True)
+
+picked_dates = st.date_input(
+    "Dates",
+    value=(today, today + timedelta(days=2)),
+    help="Defaults to today plus the next two days. Choose any custom date range.",
+)
+
+# Streamlit returns a tuple/list for a range picker. While the user is choosing
+# the second date it can temporarily contain only one value.
+if isinstance(picked_dates, (tuple, list)):
+    start_date = picked_dates[0]
+    end_date = picked_dates[-1]
+else:
+    start_date = picked_dates
+    end_date = picked_dates
+
+refresh = st.button("Refresh schedules", type="primary")
 
 if end_date < start_date:
     st.error("'Through' must be on or after 'From'.")
@@ -330,12 +396,18 @@ with st.spinner("Loading rink calendars…"):
 errors = df[df["session"] == "SCRAPE ERROR"] if not df.empty else pd.DataFrame()
 sessions = df[df["session"] != "SCRAPE ERROR"].copy() if not df.empty else df
 
+# Always show the three configured sources and how many matches were found.
+status_cols = st.columns(3)
+for col, rink in zip(status_cols, RINKS):
+    count = 0 if sessions.empty else int((sessions["rink"] == rink["rink"]).sum())
+    col.metric(rink["rink"], f"{count} session" + ("" if count == 1 else "s"))
+
 if not errors.empty:
     for _, row in errors.iterrows():
         st.warning(f'{row["rink"]}: {row["details"]}')
 
 if sessions.empty:
-    st.info("No matching sessions found for this date range.")
+    st.info("No matching sessions found for the selected dates. Check the rink counters above; a zero can also mean that rink changed its embedded calendar markup.")
 else:
     rink_filter = st.multiselect(
         "Rinks",
