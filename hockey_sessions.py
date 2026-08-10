@@ -23,6 +23,7 @@ from urllib.parse import urlencode, urlparse, parse_qs, quote, urlsplit, urlunsp
 
 import pandas as pd
 from zoneinfo import ZoneInfo
+from dateutil.rrule import rrulestr
 import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -778,182 +779,181 @@ POND_GOOGLE_CALENDARS = [
 ]
 
 
-def _google_calendar_embed_url(calendar_id: str, selected: date) -> str:
-    """
-    Build a one-calendar Google Calendar agenda URL for exactly one selected day.
-
-    Google newembed accepts the calendar ID as URL-safe base64 in `src`.
-    """
-    encoded_src = base64.urlsafe_b64encode(
-        calendar_id.encode("utf-8")
-    ).decode("ascii").rstrip("=")
-
-    start_ymd = selected.strftime("%Y%m%d")
-    end_ymd = (selected + timedelta(days=1)).strftime("%Y%m%d")
-
-    params = urlencode({
-        "height": 700,
-        "wkst": 1,
-        "bgcolor": "#ffffff",
-        "ctz": "America/Chicago",
-        "mode": "AGENDA",
-        # Google Calendar treats the second date as the exclusive range end.
-        # For one selected day, use selected -> next day, not selected -> selected.
-        "dates": f"{start_ymd}/{end_ymd}",
-        "showTitle": 0,
-        "showNav": 0,
-        "showDate": 1,
-        "showPrint": 0,
-        "showTabs": 0,
-        "showCalendars": 0,
-        "showTz": 0,
-        "src": encoded_src,
-    })
-
-    return f"https://calendar.google.com/calendar/u/0/newembed?{params}"
+def _unfold_ics_lines(ics_text: str) -> list[str]:
+    raw = ics_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    for line in raw:
+        if line.startswith((" ", "\t")) and out:
+            out[-1] += line[1:]
+        else:
+            out.append(line)
+    return out
 
 
-def _parse_google_agenda_date(line: str, selected_year: int) -> date | None:
-    s = norm(line).upper().replace("|", " ")
-    months = {
-        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
-        "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
-        "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-    }
-
-    m = re.search(r"\b(\d{1,2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b", s)
-    if m:
-        try:
-            return date(selected_year, months[m.group(2)], int(m.group(1)))
-        except ValueError:
-            return None
-
-    m = re.search(r"\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{1,2})\b", s)
-    if m:
-        try:
-            return date(selected_year, months[m.group(1)], int(m.group(2)))
-        except ValueError:
-            return None
-
-    return None
-
-
-def _parse_google_time_range(text: str) -> tuple[str, str]:
-    s = norm(text)
-
-    m = re.search(
-        r"\b(\d{1,2}(?::\d{2})?)\s*(am|pm)?\s*[-–—]\s*"
-        r"(\d{1,2}(?::\d{2})?)\s*(am|pm)\b",
-        s,
-        re.I,
+def _ics_unescape(value: str) -> str:
+    return (
+        value.replace("\\n", " ")
+             .replace("\\N", " ")
+             .replace("\\,", ",")
+             .replace("\\;", ";")
+             .replace("\\\\", "\\")
     )
-    if m:
-        start_suffix = (m.group(2) or m.group(4)).upper()
-        return f"{m.group(1)} {start_suffix}", f"{m.group(3)} {m.group(4).upper()}"
-
-    m = re.search(
-        r"\b(\d{1,2}(?::\d{2})?)\s*(am|pm)\s*[-–—]\s*"
-        r"(\d{1,2}(?::\d{2})?)\s*(am|pm)?\b",
-        s,
-        re.I,
-    )
-    if m:
-        end_suffix = (m.group(4) or m.group(2)).upper()
-        return f"{m.group(1)} {m.group(2).upper()}", f"{m.group(3)} {end_suffix}"
-
-    return times_from_text(s)
 
 
-def _parse_single_pond_calendar(
-    body_text: str,
-    selected: date,
-    session_name: str,
-    source_url: str,
-) -> list[dict]:
-    """
-    Parse one isolated Google Calendar agenda by first locating the selected
-    date block, then scanning only that block for the requested session.
+def _parse_ics_datetime(prop_name: str, value: str) -> datetime | None:
+    """Parse common Google Calendar DTSTART/DTEND/EXDATE values."""
+    local_tz = ZoneInfo("America/Chicago")
+    value = value.strip()
 
-    This is safer than maintaining a rolling current_date because Google's
-    rendered agenda text can omit/reorder headings depending on viewport.
-    """
-    raw_lines = re.split(r"[\r\n]+", body_text or "")
-    lines = [norm(x) for x in raw_lines if norm(x)]
+    try:
+        if "VALUE=DATE" in prop_name.upper() or re.fullmatch(r"\d{8}", value):
+            return datetime.strptime(value[:8], "%Y%m%d").replace(tzinfo=local_tz)
 
-    # Locate every agenda date heading.
-    headings = []
-    for i, line in enumerate(lines):
-        d = _parse_google_agenda_date(line, selected.year)
-        if d:
-            headings.append((i, d))
+        if value.endswith("Z"):
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+            return dt.replace(tzinfo=timezone.utc).astimezone(local_tz)
 
-    # Build candidate slices for the selected date only.
-    selected_slices = []
-    for idx, (line_i, d) in enumerate(headings):
-        if d != selected:
+        tz_match = re.search(r"TZID=([^;:]+)", prop_name, re.I)
+        if tz_match:
+            tzid = tz_match.group(1)
+            try:
+                tz = ZoneInfo(tzid)
+            except Exception:
+                tz = local_tz
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=tz)
+            return dt.astimezone(local_tz)
+
+        dt = datetime.strptime(value, "%Y%m%dT%H%M%S")
+        return dt.replace(tzinfo=local_tz)
+    except Exception:
+        return None
+
+
+def _parse_ics_events(ics_text: str) -> list[dict]:
+    """Parse VEVENT blocks while preserving recurrence information."""
+    lines = _unfold_ics_lines(ics_text)
+    events = []
+    current = None
+
+    for line in lines:
+        if line == "BEGIN:VEVENT":
+            current = {"EXDATE": []}
             continue
-        next_i = headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
-        selected_slices.append(lines[line_i:next_i])
 
-    # Some Google renders can put the date as separate adjacent tokens instead
-    # of one heading line. Fallback to the whole body only if it contains a
-    # strong selected-date token.
-    if not selected_slices:
-        mon = selected.strftime("%b").upper()
-        day = str(selected.day)
-        strong_date = any(
-            re.search(rf"\b{re.escape(day)}\b.*\b{mon}\b|\b{mon}\b.*\b{re.escape(day)}\b", line.upper())
-            for line in lines
-        )
-        if strong_date:
-            selected_slices = [lines]
+        if line == "END:VEVENT":
+            if current is not None:
+                events.append(current)
+            current = None
+            continue
+
+        if current is None or ":" not in line:
+            continue
+
+        key, value = line.split(":", 1)
+        base = key.split(";", 1)[0].upper()
+
+        if base == "SUMMARY":
+            current["SUMMARY"] = _ics_unescape(value)
+        elif base == "DTSTART":
+            current["DTSTART"] = _parse_ics_datetime(key, value)
+        elif base == "DTEND":
+            current["DTEND"] = _parse_ics_datetime(key, value)
+        elif base == "RRULE":
+            current["RRULE"] = value.strip()
+        elif base == "RECURRENCE-ID":
+            current["RECURRENCE-ID"] = _parse_ics_datetime(key, value)
+        elif base == "EXDATE":
+            for part in value.split(","):
+                dt = _parse_ics_datetime(key, part)
+                if dt:
+                    current["EXDATE"].append(dt)
+        elif base == "STATUS":
+            current["STATUS"] = value.strip().upper()
+
+    return events
+
+
+def _expand_ics_event_for_date(event: dict, selected: date) -> list[tuple[datetime, datetime | None]]:
+    """
+    Expand one VEVENT for exactly the selected local date.
+
+    Handles normal events, recurring RRULE events, EXDATE exclusions, and
+    detached recurrence overrides (RECURRENCE-ID events).
+    """
+    local_tz = ZoneInfo("America/Chicago")
+    start_dt = event.get("DTSTART")
+    end_dt = event.get("DTEND")
+
+    if not start_dt or event.get("STATUS") == "CANCELLED":
+        return []
+
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=local_tz)
+    else:
+        start_dt = start_dt.astimezone(local_tz)
+
+    if end_dt:
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=local_tz)
+        else:
+            end_dt = end_dt.astimezone(local_tz)
+
+    duration = (end_dt - start_dt) if end_dt else None
+    day_start = datetime.combine(selected, datetime.min.time(), tzinfo=local_tz)
+    day_end = day_start + timedelta(days=1)
+
+    # Detached override / ordinary non-recurring event.
+    if not event.get("RRULE"):
+        if day_start <= start_dt < day_end:
+            return [(start_dt, start_dt + duration if duration else end_dt)]
+        return []
+
+    try:
+        rule = rrulestr(event["RRULE"], dtstart=start_dt)
+        occurrences = rule.between(day_start, day_end, inc=True)
+    except Exception:
+        return []
+
+    excluded = set()
+    for ex in event.get("EXDATE", []):
+        if ex.tzinfo is None:
+            ex = ex.replace(tzinfo=local_tz)
+        else:
+            ex = ex.astimezone(local_tz)
+        excluded.add(ex.replace(microsecond=0))
 
     rows = []
-    seen = set()
+    for occ in occurrences:
+        if occ.tzinfo is None:
+            occ = occ.replace(tzinfo=local_tz)
+        else:
+            occ = occ.astimezone(local_tz)
 
-    for block in selected_slices:
-        for i, line in enumerate(block):
-            if session_name.lower() not in line.lower():
-                continue
+        if occ.replace(microsecond=0) in excluded:
+            continue
 
-            # Prefer the immediately preceding lines because Google agenda puts
-            # the time before the event title.
-            context = " | ".join(block[max(0, i - 4):min(len(block), i + 3)])
-            start_time, end_time = _parse_google_time_range(context)
-
-            if not start_time:
-                continue
-
-            key = (selected.isoformat(), start_time, end_time, session_name)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            rows.append({
-                "date": selected.isoformat(),
-                "start": start_time,
-                "end": end_time,
-                "rink": "The Pond",
-                "session": session_name,
-                "details": f"GOOGLE CALENDAR DIRECT | selected={selected.isoformat()} | {context}",
-                "source": source_url,
-            })
+        rows.append((occ, occ + duration if duration else None))
 
     return rows
 
 
+def _format_clock(dt: datetime | None) -> str:
+    if not dt:
+        return ""
+    # Portable 12-hour formatting without leading zero.
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
 def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
     """
-    Query The Pond's two Google Calendars directly.
+    Query The Pond's two public Google Calendar ICS feeds directly and expand
+    recurring events for exactly the selected date.
 
     Barn Time:
         thebarnrinkcalendar@gmail.com
 
     Pond Time:
         thepondcalendar@gmail.com
-
-    This completely bypasses the SportsEngine/Pond schedule page and its
-    iframe/lazy-load behavior.
     """
     selected = start
     rows = []
@@ -961,70 +961,122 @@ def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
     for cal in POND_GOOGLE_CALENDARS:
         calendar_id = cal["calendar_id"]
         session_name = cal["session"]
-        agenda_url = _google_calendar_embed_url(calendar_id, selected)
 
-        cal_page = page.context.new_page()
+        encoded_id = quote(calendar_id, safe="")
+        ics_url = (
+            "https://calendar.google.com/calendar/ical/"
+            f"{encoded_id}/public/basic.ics"
+        )
+
         try:
-            cal_page.goto(
-                agenda_url,
-                wait_until="domcontentloaded",
-                timeout=45_000,
-            )
+            response = page.request.get(ics_url, timeout=20_000)
+        except Exception as exc:
+            rows.append({
+                "date": selected.isoformat(),
+                "start": "",
+                "end": "",
+                "rink": "The Pond",
+                "session": "POND DEBUG",
+                "details": f"ICS REQUEST ERROR | {calendar_id} | {exc}",
+                "source": ics_url,
+            })
+            continue
 
-            try:
-                cal_page.wait_for_load_state("networkidle", timeout=12_000)
-            except PlaywrightTimeoutError:
-                pass
+        if not response.ok:
+            rows.append({
+                "date": selected.isoformat(),
+                "start": "",
+                "end": "",
+                "rink": "The Pond",
+                "session": "POND DEBUG",
+                "details": (
+                    f"ICS HTTP {response.status} | {calendar_id} | {ics_url}"
+                ),
+                "source": ics_url,
+            })
+            continue
 
-            cal_page.wait_for_timeout(3000)
+        try:
+            events = _parse_ics_events(response.text())
+        except Exception as exc:
+            rows.append({
+                "date": selected.isoformat(),
+                "start": "",
+                "end": "",
+                "rink": "The Pond",
+                "session": "POND DEBUG",
+                "details": f"ICS PARSE ERROR | {calendar_id} | {exc}",
+                "source": ics_url,
+            })
+            continue
 
-            bodies = []
+        matched = 0
 
-            try:
-                bodies.append(
-                    cal_page.locator("body").inner_text(timeout=7000)
-                )
-            except Exception:
-                pass
+        for event in events:
+            summary = norm(event.get("SUMMARY", ""))
+            if session_name.lower() not in summary.lower():
+                continue
 
-            for frame in cal_page.frames:
-                if frame == cal_page.main_frame:
-                    continue
-                try:
-                    bodies.append(
-                        frame.locator("body").inner_text(timeout=5000)
-                    )
-                except Exception:
-                    continue
+            for occurrence_start, occurrence_end in _expand_ics_event_for_date(
+                event, selected
+            ):
+                rows.append({
+                    "date": selected.isoformat(),
+                    "start": _format_clock(occurrence_start),
+                    "end": _format_clock(occurrence_end),
+                    "rink": "The Pond",
+                    "session": session_name,
+                    "details": (
+                        f"GOOGLE ICS | {calendar_id} | {summary} | "
+                        f"RRULE={event.get('RRULE', '')}"
+                    ),
+                    "source": ics_url,
+                })
+                matched += 1
 
-            cal_rows = []
-            for body in bodies:
-                cal_rows.extend(
-                    _parse_single_pond_calendar(
-                        body,
-                        selected,
-                        session_name,
-                        agenda_url,
-                    )
-                )
+        if matched == 0:
+            # Keep a diagnostic row hidden from the public schedule so we can
+            # distinguish "feed accessible, no match" from "feed unavailable".
+            summaries = sorted({
+                norm(e.get("SUMMARY", ""))
+                for e in events
+                if e.get("SUMMARY")
+            })
+            interesting = [
+                s for s in summaries
+                if "barn" in s.lower() or "pond" in s.lower() or "time" in s.lower()
+            ][:20]
 
-            # De-dupe identical event occurrences from overlapping frame text.
-            seen = set()
-            for row in cal_rows:
-                key = (
-                    row["date"],
-                    row["start"],
-                    row["end"],
-                    row["session"],
-                )
-                if key not in seen:
-                    seen.add(key)
-                    rows.append(row)
+            rows.append({
+                "date": selected.isoformat(),
+                "start": "",
+                "end": "",
+                "rink": "The Pond",
+                "session": "POND DEBUG",
+                "details": (
+                    f"ICS OK, 0 {session_name} occurrences on {selected} | "
+                    f"calendar={calendar_id} | "
+                    f"candidate summaries={interesting}"
+                ),
+                "source": ics_url,
+            })
 
-        finally:
-            cal_page.close()
+    # Strict de-dupe; Barn Time and Pond Time remain separate.
+    unique = []
+    seen = set()
+    for row in rows:
+        key = (
+            row["date"],
+            row["start"],
+            row["end"],
+            row["session"],
+            row["details"] if row["session"] == "POND DEBUG" else "",
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
 
-    return rows
+    return unique
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1194,6 +1246,18 @@ else:
                 ),
             },
         )
+
+with st.expander("Pond feed debug"):
+    pond_debug = sessions[
+        (sessions["rink"] == "The Pond") &
+        (sessions["session"] == "POND DEBUG")
+    ] if not sessions.empty else sessions
+
+    if pond_debug.empty:
+        st.caption("No Pond feed error recorded.")
+    else:
+        for _, row in pond_debug.iterrows():
+            st.code(row["details"])
 
 with st.expander("Source diagnostics"):
     st.caption("Validation mode: Crossover is NETWORK-FIRST. Stick & Puck uses event_type=22; Private Hockey Coaches Ice uses event_type=13. Details begin with NETWORK JSON when the real DaySmart payload was used, or DOM FALLBACK otherwise.")
