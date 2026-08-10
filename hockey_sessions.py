@@ -253,6 +253,154 @@ def scrape_all_scopes(page, rink: dict, start: date, end: date) -> list[dict]:
             unique.append(row)
     return unique
 
+
+def scrape_crossover_filtered(page, rink: dict, selected: date, event_type: int, session_name: str) -> list[dict]:
+    """
+    Crossover Stick & Puck has a stable DaySmart event type filter:
+    event_type=22.
+
+    Because the URL is already filtered to one event type and one date, do not
+    infer the event date from surrounding calendar text. Each rendered calendar
+    event on this page is a Stick & Puck candidate for the selected date.
+    """
+    params = urlencode({
+        "start": selected.isoformat(),
+        "end": selected.isoformat(),
+        "event_type": event_type,
+    })
+    url = f'{rink["url"]}?{params}'
+
+    page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=12_000)
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(3500)
+
+    # FullCalendar / DaySmart has used several event wrappers over time.
+    # Search only event-like elements, not every link on the page.
+    selectors = [
+        ".fc-event",
+        ".fc-timegrid-event",
+        ".fc-daygrid-event",
+        ".fc-list-event",
+        "[class*='fc-event']",
+        "[data-event-id]",
+    ]
+
+    rows = []
+    seen = set()
+
+    for selector in selectors:
+        try:
+            nodes = page.locator(selector)
+            count = min(nodes.count(), 500)
+        except Exception:
+            continue
+
+        for i in range(count):
+            try:
+                node = nodes.nth(i)
+
+                pieces = []
+                for getter in (
+                    lambda: node.inner_text(timeout=700),
+                    lambda: node.get_attribute("aria-label"),
+                    lambda: node.get_attribute("title"),
+                    lambda: node.get_attribute("data-title"),
+                ):
+                    try:
+                        value = getter()
+                        if value:
+                            value = norm(value)
+                            if value and value not in pieces:
+                                pieces.append(value)
+                    except Exception:
+                        pass
+
+                # Include a *small* immediate parent only if it is short.
+                # Do not climb multiple parents: that was the source of wrong
+                # neighboring-event times in earlier versions.
+                try:
+                    parent_text = norm(node.locator("xpath=..").inner_text(timeout=700))
+                    if parent_text and len(parent_text) <= 350 and parent_text not in pieces:
+                        pieces.append(parent_text)
+                except Exception:
+                    pass
+
+                blob = " | ".join(pieces)
+                if not blob:
+                    continue
+
+                # The URL is already filtered to the requested event type.
+                # Require the session title words when available to avoid
+                # accidentally treating calendar navigation as an event.
+                expected_words = [w for w in session_name.lower().split() if len(w) > 2]
+                if expected_words and not any(w in blob.lower() for w in expected_words):
+                    continue
+
+                start_time, end_time = times_from_text(blob)
+
+                # Some calendar event elements may only expose the start time.
+                # Keep the event rather than borrowing an end time from a
+                # neighboring element.
+                key = (selected.isoformat(), start_time, end_time, blob.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                rows.append({
+                    "date": selected.isoformat(),
+                    "start": start_time,
+                    "end": end_time,
+                    "rink": "Crossover",
+                    "session": session_name,
+                    "details": blob,
+                    "source": url,
+                })
+            except Exception:
+                continue
+
+    # Fallback: inspect raw rendered lines, preserving line breaks.
+    # Since this page is filtered to event_type=22, each occurrence is valid.
+    if not rows:
+        try:
+            raw = page.locator("body").inner_text(timeout=7000)
+        except Exception:
+            raw = ""
+
+        lines = [norm(x) for x in re.split(r"[\r\n]+", raw) if norm(x)]
+        expected_words = [w for w in session_name.lower().split() if len(w) > 2]
+        for i, line in enumerate(lines):
+            if expected_words and any(w in line.lower() for w in expected_words):
+                context = " | ".join(lines[max(0, i-2):min(len(lines), i+3)])
+                start_time, end_time = times_from_text(context)
+                key = (selected.isoformat(), start_time, end_time, context.lower())
+                if key not in seen:
+                    seen.add(key)
+                    rows.append({
+                        "date": selected.isoformat(),
+                        "start": start_time,
+                        "end": end_time,
+                        "rink": "Crossover",
+                        "session": session_name,
+                        "details": context,
+                        "source": url,
+                    })
+
+    # Prefer time-sorted output.
+    def time_sort_key(row):
+        raw = row["start"]
+        try:
+            return datetime.strptime(raw, "%I:%M %p")
+        except Exception:
+            try:
+                return datetime.strptime(raw, "%I %p")
+            except Exception:
+                return datetime.max
+
+    return sorted(rows, key=time_sort_key)
+
 def scrape_daysmart(page, rink: dict, start: date, end: date) -> list[dict]:
     # DaySmart accepts start/end query params on calendar URLs.
     params = urlencode({"start": start.isoformat(), "end": end.isoformat()})
@@ -318,7 +466,20 @@ def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
         for rink in RINKS:
             page = context.new_page()
             try:
-                if rink["kind"] == "daysmart":
+                if rink["rink"] == "Crossover":
+                    # Use DaySmart's explicit event-type filters for both
+                    # Crossover session categories.
+                    rows.extend(
+                        scrape_crossover_filtered(
+                            page, rink, start, 22, "Stick & Puck"
+                        )
+                    )
+                    rows.extend(
+                        scrape_crossover_filtered(
+                            page, rink, start, 13, "Private Hockey Coaches Ice"
+                        )
+                    )
+                elif rink["kind"] == "daysmart":
                     rows.extend(scrape_daysmart(page, rink, start, end))
                 else:
                     rows.extend(scrape_pond(page, rink, start, end))
@@ -345,7 +506,7 @@ def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
     if not df.empty:
         # De-duplicate conservatively and sort dated sessions first.
         df = df.drop_duplicates(
-            subset=["date", "start", "end", "rink", "session", "details"]
+            subset=["date", "start", "end", "rink", "session"]
         )
         df["_sortdate"] = pd.to_datetime(df["date"], errors="coerce")
         df = (
@@ -427,7 +588,7 @@ else:
         )
 
 with st.expander("Source diagnostics"):
-    st.caption("Use this only while validating scraper accuracy.")
+    st.caption("Validation mode: Crossover uses DaySmart event_type=22 for Stick & Puck and event_type=13 for Private Hockey Coaches Ice.")
     for rink in RINKS:
         rink_name = rink["rink"]
         rink_rows = sessions[sessions["rink"] == rink_name] if not sessions.empty else sessions
