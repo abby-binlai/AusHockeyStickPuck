@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import re
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs, quote
 
 import pandas as pd
+from zoneinfo import ZoneInfo
 import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -561,19 +562,193 @@ def scrape_daysmart(page, rink: dict, start: date, end: date) -> list[dict]:
     return scrape_all_scopes(page, rink, start, end)
 
 
+def _unfold_ics(text: str) -> list[str]:
+    """Unfold RFC 5545 continuation lines."""
+    raw = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    for line in raw:
+        if line.startswith((" ", "\t")) and out:
+            out[-1] += line[1:]
+        else:
+            out.append(line)
+    return out
+
+
+def _parse_ics_dt(key: str, value: str) -> datetime | None:
+    """
+    Parse common Google Calendar ICS date/time formats.
+    Returns an America/Chicago-aware datetime where possible.
+    """
+    tz = ZoneInfo("America/Chicago")
+    value = value.strip()
+
+    try:
+        # All-day date.
+        if "VALUE=DATE" in key.upper() or re.fullmatch(r"\d{8}", value):
+            dt = datetime.strptime(value[:8], "%Y%m%d")
+            return dt.replace(tzinfo=tz)
+
+        # UTC timestamp.
+        if value.endswith("Z"):
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            return dt.astimezone(tz)
+
+        # Explicit TZID in property key.
+        m = re.search(r"TZID=([^;:]+)", key, re.I)
+        if m:
+            tzid = m.group(1)
+            try:
+                event_tz = ZoneInfo(tzid)
+            except Exception:
+                event_tz = tz
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=event_tz)
+            return dt.astimezone(tz)
+
+        # Floating time: treat as local Austin time.
+        dt = datetime.strptime(value, "%Y%m%dT%H%M%S")
+        return dt.replace(tzinfo=tz)
+    except Exception:
+        return None
+
+
+def _parse_google_ics(ics_text: str, selected: date, source_url: str) -> list[dict]:
+    """Parse Barn Time / Pond Time events from a public Google Calendar ICS feed."""
+    lines = _unfold_ics(ics_text)
+    events = []
+    current = None
+
+    for line in lines:
+        if line == "BEGIN:VEVENT":
+            current = {}
+            continue
+        if line == "END:VEVENT":
+            if current:
+                summary = norm(current.get("SUMMARY", ""))
+                lower = summary.lower()
+
+                session = None
+                if "barn time" in lower:
+                    session = "Barn Time"
+                elif "pond time" in lower:
+                    session = "Pond Time"
+
+                if session:
+                    start_dt = current.get("_START_DT")
+                    end_dt = current.get("_END_DT")
+                    if start_dt and start_dt.date() == selected:
+                        events.append({
+                            "date": selected.isoformat(),
+                            "start": start_dt.strftime("%-I:%M %p"),
+                            "end": end_dt.strftime("%-I:%M %p") if end_dt else "",
+                            "rink": "The Pond",
+                            "session": session,
+                            "details": f"GOOGLE CALENDAR ICS | {summary}",
+                            "source": source_url,
+                        })
+            current = None
+            continue
+
+        if current is None or ":" not in line:
+            continue
+
+        key, value = line.split(":", 1)
+        base_key = key.split(";", 1)[0].upper()
+
+        if base_key == "SUMMARY":
+            current["SUMMARY"] = value.replace("\\,", ",").replace("\\n", " ")
+        elif base_key == "DTSTART":
+            current["_START_DT"] = _parse_ics_dt(key, value)
+        elif base_key == "DTEND":
+            current["_END_DT"] = _parse_ics_dt(key, value)
+
+    return events
+
+
 def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
+    """
+    The Pond page contains public Google Calendar embeds.
+
+    Strategy:
+    1. Load The Pond schedule page.
+    2. Extract every Google Calendar iframe src.
+    3. Read each iframe's `src=` calendar ID(s).
+    4. Fetch the corresponding public ICS feed directly.
+    5. Keep only Barn Time / Pond Time for the selected date.
+
+    Falls back to rendered-page scraping if no ICS events can be retrieved.
+    """
+    selected = start
+
     page.goto(rink["url"], wait_until="domcontentloaded", timeout=45_000)
     try:
         page.wait_for_load_state("networkidle", timeout=12_000)
     except PlaywrightTimeoutError:
         pass
-    page.wait_for_timeout(4500)
+    page.wait_for_timeout(3500)
 
+    calendar_ids = []
+    iframe_sources = []
+
+    try:
+        iframes = page.locator("iframe")
+        for i in range(iframes.count()):
+            try:
+                src = iframes.nth(i).get_attribute("src") or ""
+            except Exception:
+                continue
+
+            if "calendar.google.com" not in src.lower():
+                continue
+
+            iframe_sources.append(src)
+            try:
+                parsed = urlparse(src)
+                qs = parse_qs(parsed.query)
+                # Google Calendar embed may contain one or more src params.
+                for cal_id in qs.get("src", []):
+                    cal_id = cal_id.strip()
+                    if cal_id and cal_id not in calendar_ids:
+                        calendar_ids.append(cal_id)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    rows = []
+
+    # Fetch public ICS feeds using Playwright's request context so Railway uses
+    # the same outbound environment as the browser.
+    for cal_id in calendar_ids:
+        encoded_id = quote(cal_id, safe="")
+        ics_url = f"https://calendar.google.com/calendar/ical/{encoded_id}/public/basic.ics"
+
+        try:
+            response = page.request.get(ics_url, timeout=20_000)
+            if not response.ok:
+                continue
+            ics_text = response.text()
+            rows.extend(_parse_google_ics(ics_text, selected, ics_url))
+        except Exception:
+            continue
+
+    # De-duplicate in case the same calendar is embedded twice.
+    if rows:
+        unique = []
+        seen = set()
+        for row in rows:
+            key = (
+                row["date"],
+                row["start"],
+                row["end"],
+                row["session"],
+            )
+            if key not in seen:
+                seen.add(key)
+                unique.append(row)
+        return unique
+
+    # Fallback: old rendered-page/frame scraping.
     rows = scrape_all_scopes(page, rink, start, end)
-
-    # Keep only rows that appear to belong to the requested range when a date
-    # could be extracted. Undated rows remain visible so site markup changes
-    # don't silently hide valid sessions.
     filtered = []
     for row in rows:
         if not row["date"]:
@@ -585,6 +760,7 @@ def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
                 filtered.append(row)
         except ValueError:
             filtered.append(row)
+
     return filtered
 
 
