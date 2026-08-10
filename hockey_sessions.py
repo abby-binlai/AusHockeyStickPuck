@@ -14,15 +14,21 @@ Run:
 from __future__ import annotations
 
 import re
+import base64
+import html as htmlmod
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs, quote, urlsplit, urlunsplit, parse_qsl
 
 import pandas as pd
+from zoneinfo import ZoneInfo
+from dateutil.rrule import rrulestr
 import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+
+APP_VERSION = "pond-direct-ics-v1"
 
 RINKS = [
     {
@@ -130,7 +136,9 @@ def scrape_rendered_events(scope, rink: dict, start: date, end: date) -> list[di
             return
 
         event_date = date_from_text(context, start.year)
-        start_time, end_time = times_from_text(context)
+        start_time, end_time = _extract_time_near_title(context, session_name)
+        if not start_time:
+            start_time, end_time = times_from_text(context)
         key = (
             rink["rink"],
             event_date or "",
@@ -304,6 +312,60 @@ def _parse_dt(value):
             except Exception:
                 pass
     return None
+
+
+def _extract_time_near_title(text: str, title: str) -> tuple[str, str]:
+    """
+    Extract the time range closest to a specific event title.
+
+    Example:
+      ... 12 – 1:15pm | 3:15pm to 4:45pm, Barn Time, Calendar: Barn Time ...
+    returns 3:15 PM - 4:45 PM, not an earlier unrelated range.
+    """
+    s = norm(text)
+    title_lower = title.lower()
+    lower = s.lower()
+
+    pos = lower.find(title_lower)
+    if pos < 0:
+        return "", ""
+
+    # Look immediately before and after the title, favoring the nearest range.
+    before = s[max(0, pos - 120):pos]
+    after = s[pos:pos + 120]
+
+    patterns = [
+        # "3:15pm to 4:45pm"
+        r"(\d{1,2}(?::\d{2})?)\s*(am|pm)?\s*(?:to|[-–—])\s*"
+        r"(\d{1,2}(?::\d{2})?)\s*(am|pm)",
+    ]
+
+    candidates = []
+    for segment, bias in ((before, 0), (after, 1000)):
+        for pattern in patterns:
+            for m in re.finditer(pattern, segment, re.I):
+                start_clock = m.group(1)
+                start_suffix = (m.group(2) or m.group(4)).upper()
+                end_clock = m.group(3)
+                end_suffix = m.group(4).upper()
+                # Distance to title: later matches in `before` are closer;
+                # earlier matches in `after` are closer.
+                if segment is before:
+                    distance = len(before) - m.end()
+                else:
+                    distance = m.start() + bias
+                candidates.append((
+                    distance,
+                    f"{start_clock} {start_suffix}",
+                    f"{end_clock} {end_suffix}",
+                ))
+
+    if not candidates:
+        return "", ""
+
+    candidates.sort(key=lambda x: x[0])
+    _, start_time, end_time = candidates[0]
+    return start_time, end_time
 
 
 def _format_clock(dt):
@@ -561,31 +623,306 @@ def scrape_daysmart(page, rink: dict, start: date, end: date) -> list[dict]:
     return scrape_all_scopes(page, rink, start, end)
 
 
-def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
-    page.goto(rink["url"], wait_until="domcontentloaded", timeout=45_000)
+BARN_TIME_EMBED_URL = "https://calendar.google.com/calendar/u/0/newembed?src=7qhvtqisrui4kshqnv1eqihb5c@group.calendar.google.com&ctz=America/Chicago"
+POND_TIME_EMBED_URL = "https://calendar.google.com/calendar/u/0/newembed?src=n5s0noinlbj56sqdl1rn43acm8@group.calendar.google.com&ctz=America/Chicago"
+
+POND_GOOGLE_CALENDARS = [
+    {
+        "calendar_id": "7qhvtqisrui4kshqnv1eqihb5c@group.calendar.google.com",
+        "session": "Barn Time",
+    },
+    {
+        "calendar_id": "n5s0noinlbj56sqdl1rn43acm8@group.calendar.google.com",
+        "session": "Pond Time",
+    },
+]
+
+
+def _unfold_ics_lines(ics_text: str) -> list[str]:
+    raw = ics_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    for line in raw:
+        if line.startswith((" ", "\t")) and out:
+            out[-1] += line[1:]
+        else:
+            out.append(line)
+    return out
+
+
+def _ics_unescape(value: str) -> str:
+    return (
+        value.replace("\\n", " ")
+             .replace("\\N", " ")
+             .replace("\\,", ",")
+             .replace("\\;", ";")
+             .replace("\\\\", "\\")
+    )
+
+
+def _parse_ics_datetime(prop_name: str, value: str) -> datetime | None:
+    """Parse common Google Calendar DTSTART/DTEND/EXDATE values."""
+    local_tz = ZoneInfo("America/Chicago")
+    value = value.strip()
+
     try:
-        page.wait_for_load_state("networkidle", timeout=12_000)
-    except PlaywrightTimeoutError:
-        pass
-    page.wait_for_timeout(4500)
+        if "VALUE=DATE" in prop_name.upper() or re.fullmatch(r"\d{8}", value):
+            return datetime.strptime(value[:8], "%Y%m%d").replace(tzinfo=local_tz)
 
-    rows = scrape_all_scopes(page, rink, start, end)
+        if value.endswith("Z"):
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+            return dt.replace(tzinfo=timezone.utc).astimezone(local_tz)
 
-    # Keep only rows that appear to belong to the requested range when a date
-    # could be extracted. Undated rows remain visible so site markup changes
-    # don't silently hide valid sessions.
-    filtered = []
-    for row in rows:
-        if not row["date"]:
-            filtered.append(row)
+        tz_match = re.search(r"TZID=([^;:]+)", prop_name, re.I)
+        if tz_match:
+            tzid = tz_match.group(1)
+            try:
+                tz = ZoneInfo(tzid)
+            except Exception:
+                tz = local_tz
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=tz)
+            return dt.astimezone(local_tz)
+
+        dt = datetime.strptime(value, "%Y%m%dT%H%M%S")
+        return dt.replace(tzinfo=local_tz)
+    except Exception:
+        return None
+
+
+def _parse_ics_events(ics_text: str) -> list[dict]:
+    """Parse VEVENT blocks while preserving recurrence information."""
+    lines = _unfold_ics_lines(ics_text)
+    events = []
+    current = None
+
+    for line in lines:
+        if line == "BEGIN:VEVENT":
+            current = {"EXDATE": []}
             continue
-        try:
-            d = date.fromisoformat(row["date"])
-            if start <= d <= end:
-                filtered.append(row)
-        except ValueError:
-            filtered.append(row)
-    return filtered
+
+        if line == "END:VEVENT":
+            if current is not None:
+                events.append(current)
+            current = None
+            continue
+
+        if current is None or ":" not in line:
+            continue
+
+        key, value = line.split(":", 1)
+        base = key.split(";", 1)[0].upper()
+
+        if base == "SUMMARY":
+            current["SUMMARY"] = _ics_unescape(value)
+        elif base == "DTSTART":
+            current["DTSTART"] = _parse_ics_datetime(key, value)
+        elif base == "DTEND":
+            current["DTEND"] = _parse_ics_datetime(key, value)
+        elif base == "RRULE":
+            current["RRULE"] = value.strip()
+        elif base == "RECURRENCE-ID":
+            current["RECURRENCE-ID"] = _parse_ics_datetime(key, value)
+        elif base == "EXDATE":
+            for part in value.split(","):
+                dt = _parse_ics_datetime(key, part)
+                if dt:
+                    current["EXDATE"].append(dt)
+        elif base == "STATUS":
+            current["STATUS"] = value.strip().upper()
+
+    return events
+
+
+def _expand_ics_event_for_date(event: dict, selected: date) -> list[tuple[datetime, datetime | None]]:
+    """
+    Expand one VEVENT for exactly the selected local date.
+
+    Handles normal events, recurring RRULE events, EXDATE exclusions, and
+    detached recurrence overrides (RECURRENCE-ID events).
+    """
+    local_tz = ZoneInfo("America/Chicago")
+    start_dt = event.get("DTSTART")
+    end_dt = event.get("DTEND")
+
+    if not start_dt or event.get("STATUS") == "CANCELLED":
+        return []
+
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=local_tz)
+    else:
+        start_dt = start_dt.astimezone(local_tz)
+
+    if end_dt:
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=local_tz)
+        else:
+            end_dt = end_dt.astimezone(local_tz)
+
+    duration = (end_dt - start_dt) if end_dt else None
+    day_start = datetime.combine(selected, datetime.min.time(), tzinfo=local_tz)
+    day_end = day_start + timedelta(days=1)
+
+    # Detached override / ordinary non-recurring event.
+    if not event.get("RRULE"):
+        if day_start <= start_dt < day_end:
+            return [(start_dt, start_dt + duration if duration else end_dt)]
+        return []
+
+    try:
+        rule = rrulestr(event["RRULE"], dtstart=start_dt)
+        occurrences = rule.between(day_start, day_end, inc=True)
+    except Exception:
+        return []
+
+    excluded = set()
+    for ex in event.get("EXDATE", []):
+        if ex.tzinfo is None:
+            ex = ex.replace(tzinfo=local_tz)
+        else:
+            ex = ex.astimezone(local_tz)
+        excluded.add(ex.replace(microsecond=0))
+
+    rows = []
+    for occ in occurrences:
+        if occ.tzinfo is None:
+            occ = occ.replace(tzinfo=local_tz)
+        else:
+            occ = occ.astimezone(local_tz)
+
+        if occ.replace(microsecond=0) in excluded:
+            continue
+
+        rows.append((occ, occ + duration if duration else None))
+
+    return rows
+
+
+def _format_clock(dt: datetime | None) -> str:
+    if not dt:
+        return ""
+    # Portable 12-hour formatting without leading zero.
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def _fetch_calendar_occurrences(
+    page,
+    calendar_id: str,
+    session_name: str,
+    selected: date,
+) -> tuple[list[dict], str]:
+    encoded_id = quote(calendar_id, safe="")
+    ics_url = (
+        "https://calendar.google.com/calendar/ical/"
+        f"{encoded_id}/public/basic.ics"
+    )
+
+    try:
+        response = page.request.get(ics_url, timeout=20_000)
+    except Exception as exc:
+        return [], f"REQUEST ERROR {calendar_id}: {exc}"
+
+    if not response.ok:
+        return [], f"HTTP {response.status} {calendar_id}"
+
+    try:
+        events = _parse_ics_events(response.text())
+    except Exception as exc:
+        return [], f"PARSE ERROR {calendar_id}: {exc}"
+
+    rows = []
+    matching_summaries = []
+
+    for event in events:
+        summary = norm(event.get("SUMMARY", ""))
+        if session_name.lower() not in summary.lower():
+            continue
+
+        matching_summaries.append(summary)
+
+        for occurrence_start, occurrence_end in _expand_ics_event_for_date(
+            event, selected
+        ):
+            rows.append({
+                "date": selected.isoformat(),
+                "start": _format_clock(occurrence_start),
+                "end": _format_clock(occurrence_end),
+                "rink": "The Pond",
+                "session": session_name,
+                "details": (
+                    f"GOOGLE ICS | calendar={calendar_id} | "
+                    f"summary={summary} | RRULE={event.get('RRULE', '')}"
+                ),
+                "source": ics_url,
+            })
+
+    debug = (
+        f"calendar={calendar_id} | "
+        f"matching summaries={sorted(set(matching_summaries))[:10]} | "
+        f"occurrences on {selected}={len(rows)}"
+    )
+    return rows, debug
+
+
+def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
+    """
+    Query the two exact public Google Calendar IDs for The Pond.
+
+    Barn Time:
+      7qhvtqisrui4kshqnv1eqihb5c@group.calendar.google.com
+
+    Pond Time:
+      n5s0noinlbj56sqdl1rn43acm8@group.calendar.google.com
+    """
+    selected = start
+    rows = []
+    debug_messages = []
+
+    for cal in POND_GOOGLE_CALENDARS:
+        calendar_id = cal["calendar_id"]
+        session_name = cal["session"]
+
+        found, debug = _fetch_calendar_occurrences(
+            page, calendar_id, session_name, selected
+        )
+        if session_name == "Barn Time":
+            for row in found:
+                row["source"] = BARN_TIME_EMBED_URL
+        elif session_name == "Pond Time":
+            for row in found:
+                row["source"] = POND_TIME_EMBED_URL
+
+        rows.extend(found)
+
+        prefix = "MATCH" if found else "NO MATCH"
+        debug_messages.append(
+            f"ACTIVE=ICS_ONLY | {session_name.upper()} {prefix} | {debug}"
+        )
+
+    # Keep diagnostics available while validating the exact calendars.
+    rows.append({
+        "date": selected.isoformat(),
+        "start": "",
+        "end": "",
+        "rink": "The Pond",
+        "session": "POND DEBUG",
+        "details": "\n".join(debug_messages),
+        "source": rink["url"],
+    })
+
+    unique = []
+    seen = set()
+    for row in rows:
+        key = (
+            row["date"],
+            row["start"],
+            row["end"],
+            row["session"],
+            row["details"] if row["session"] == "POND DEBUG" else "",
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+
+    return unique
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -669,6 +1006,7 @@ def scrape_all(start_iso: str, end_iso: str) -> pd.DataFrame:
 
 st.set_page_config(page_title="Austin Hockey Ice Finder", page_icon="🏒", layout="wide")
 st.title("🏒 Austin Hockey Ice Finder")
+st.caption(f"Build: {APP_VERSION}")
 st.caption(
     "Single-day view · Crossover, Chaparral, and The Pond"
 )
@@ -713,35 +1051,36 @@ else:
     for rink in RINKS:
         rink_name = rink["rink"]
         rink_rows = sessions[sessions["rink"] == rink_name].copy()
+        public_rink_rows = rink_rows[rink_rows["session"] != "POND DEBUG"].copy()
 
         # Sort chronologically by start time (e.g. 9 AM before 12 PM before 4 PM).
-        if not rink_rows.empty:
-            rink_rows["_start_sort"] = pd.to_datetime(
-                rink_rows["start"], format="%I:%M %p", errors="coerce"
+        if not public_rink_rows.empty:
+            public_rink_rows["_start_sort"] = pd.to_datetime(
+                public_rink_rows["start"], format="%I:%M %p", errors="coerce"
             )
             # Also support times rendered without minutes, e.g. "9 AM".
-            missing_sort = rink_rows["_start_sort"].isna()
+            missing_sort = public_rink_rows["_start_sort"].isna()
             if missing_sort.any():
-                rink_rows.loc[missing_sort, "_start_sort"] = pd.to_datetime(
-                    rink_rows.loc[missing_sort, "start"],
+                public_rink_rows.loc[missing_sort, "_start_sort"] = pd.to_datetime(
+                    public_rink_rows.loc[missing_sort, "start"],
                     format="%I %p",
                     errors="coerce",
                 )
-            rink_rows = (
-                rink_rows.sort_values("_start_sort", na_position="last")
-                         .drop(columns="_start_sort")
+            public_rink_rows = (
+                public_rink_rows.sort_values("_start_sort", na_position="last")
+                                .drop(columns="_start_sort")
             )
 
         st.subheader(rink_name)
 
-        if rink_rows.empty:
+        if public_rink_rows.empty:
             st.caption("No matching sessions found.")
             continue
 
         # Only show schedule fields useful for verification.
         display_cols = ["start", "end", "session", "source"]
         st.dataframe(
-            rink_rows[display_cols],
+            public_rink_rows[display_cols],
             hide_index=True,
             use_container_width=True,
             column_config={
@@ -754,6 +1093,18 @@ else:
                 ),
             },
         )
+
+with st.expander("Pond feed debug"):
+    pond_debug = sessions[
+        (sessions["rink"] == "The Pond") &
+        (sessions["session"] == "POND DEBUG")
+    ] if not sessions.empty else sessions
+
+    if pond_debug.empty:
+        st.caption("No Pond feed error recorded.")
+    else:
+        for _, row in pond_debug.iterrows():
+            st.code(row["details"])
 
 with st.expander("Source diagnostics"):
     st.caption("Validation mode: Crossover is NETWORK-FIRST. Stick & Puck uses event_type=22; Private Hockey Coaches Ice uses event_type=13. Details begin with NETWORK JSON when the real DaySmart payload was used, or DOM FALLBACK otherwise.")
