@@ -476,7 +476,7 @@ def scrape_daysmart_filtered(page, rink: dict, selected: date,
     url = f'{rink["url"]}?{params}'
 
     network_rows, network_urls = capture_daysmart_json_events(
-        page, url, selected, 'Crossover', session_name
+        page, url, selected, rink["rink"], session_name
     )
     if network_rows:
         return network_rows
@@ -534,7 +534,7 @@ def scrape_daysmart_filtered(page, rink: dict, selected: date,
                     'date': selected.isoformat(),
                     'start': start_time,
                     'end': end_time,
-                    'rink': 'Crossover',
+                    'rink': rink["rink"],
                     'session': session_name,
                     'details': 'DOM FALLBACK | ' + blob + ' | CAPTURED URLS: ' + ' ; '.join(network_urls[:20]),
                     'source': url,
