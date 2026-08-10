@@ -17,7 +17,7 @@ import re
 import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
-from urllib.parse import urlencode, urlparse, parse_qs, quote
+from urllib.parse import urlencode, urlparse, parse_qs, quote, urlsplit, urlunsplit, parse_qsl
 
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -664,18 +664,120 @@ def _parse_google_ics(ics_text: str, selected: date, source_url: str) -> list[di
     return events
 
 
+def _google_embed_for_date(src: str, selected: date) -> str:
+    """
+    Force a Google Calendar embed into agenda mode for one selected date.
+    This lets Google expand recurring events itself instead of us trying to
+    interpret RRULE/EXDATE/RDATE recurrence logic from ICS.
+    """
+    parts = urlsplit(src)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    ymd = selected.strftime("%Y%m%d")
+
+    params["mode"] = "AGENDA"
+    params["dates"] = f"{ymd}/{ymd}"
+    params["showTitle"] = "0"
+    params["showNav"] = "0"
+    params["showDate"] = "1"
+    params["showPrint"] = "0"
+    params["showTabs"] = "0"
+    params["showCalendars"] = "0"
+    params["showTz"] = "0"
+    params["ctz"] = "America/Chicago"
+
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(params, doseq=True),
+        parts.fragment,
+    ))
+
+
+def _pond_event_rows_from_text(
+    body_text: str,
+    selected: date,
+    source_url: str,
+) -> list[dict]:
+    """
+    Parse only exact Barn Time / Pond Time occurrences from a one-day Google
+    Calendar agenda view.
+
+    The agenda text commonly places the event title and time on nearby lines,
+    so inspect a small local window only. Never borrow context from the whole
+    calendar.
+    """
+    raw_lines = re.split(r"[\r\n]+", body_text or "")
+    lines = [norm(x) for x in raw_lines if norm(x)]
+    rows = []
+    seen = set()
+
+    for i, line in enumerate(lines):
+        lower = line.lower()
+
+        if "barn time" in lower:
+            session = "Barn Time"
+        elif "pond time" in lower:
+            session = "Pond Time"
+        else:
+            continue
+
+        # Keep a very small context window around this exact event.
+        lo = max(0, i - 3)
+        hi = min(len(lines), i + 4)
+        context_lines = lines[lo:hi]
+        context = " | ".join(context_lines)
+
+        start_time, end_time = times_from_text(context)
+
+        # Google agenda sometimes formats a range with an en dash / hyphen
+        # but our generic parser may see only one time. Try a direct range.
+        if not end_time:
+            m = re.search(
+                r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM))\s*[-–—]\s*"
+                r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM))",
+                context,
+                re.I,
+            )
+            if m:
+                start_time = norm(m.group(1)).upper()
+                end_time = norm(m.group(2)).upper()
+
+        if not start_time:
+            continue
+
+        key = (session, start_time, end_time)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rows.append({
+            "date": selected.isoformat(),
+            "start": start_time,
+            "end": end_time,
+            "rink": "The Pond",
+            "session": session,
+            "details": f"GOOGLE CALENDAR AGENDA | {context}",
+            "source": source_url,
+        })
+
+    return rows
+
+
 def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
     """
-    The Pond page contains public Google Calendar embeds.
+    Scrape The Pond's two embedded Google Calendars.
 
-    Strategy:
-    1. Load The Pond schedule page.
-    2. Extract every Google Calendar iframe src.
-    3. Read each iframe's `src=` calendar ID(s).
-    4. Fetch the corresponding public ICS feed directly.
-    5. Keep only Barn Time / Pond Time for the selected date.
+    Important: do NOT use the ICS feed here. The calendars can contain recurring
+    events, and the raw ICS recurrence rules do not necessarily equal the
+    expanded occurrences visible on a selected day.
 
-    Falls back to rendered-page scraping if no ICS events can be retrieved.
+    Instead:
+    1. Open The Pond schedule page.
+    2. Find its Google Calendar iframe URLs.
+    3. Re-open each calendar in Google Agenda mode constrained to the selected
+       date, letting Google expand recurring events.
+    4. Extract only exact "Barn Time" and "Pond Time" occurrences.
     """
     selected = start
 
@@ -684,84 +786,80 @@ def scrape_pond(page, rink: dict, start: date, end: date) -> list[dict]:
         page.wait_for_load_state("networkidle", timeout=12_000)
     except PlaywrightTimeoutError:
         pass
-    page.wait_for_timeout(3500)
+    page.wait_for_timeout(3000)
 
-    calendar_ids = []
-    iframe_sources = []
-
+    embed_urls = []
     try:
         iframes = page.locator("iframe")
-        for i in range(iframes.count()):
+        count = min(iframes.count(), 100)
+        for i in range(count):
             try:
                 src = iframes.nth(i).get_attribute("src") or ""
             except Exception:
                 continue
-
-            if "calendar.google.com" not in src.lower():
-                continue
-
-            iframe_sources.append(src)
-            try:
-                parsed = urlparse(src)
-                qs = parse_qs(parsed.query)
-                # Google Calendar embed may contain one or more src params.
-                for cal_id in qs.get("src", []):
-                    cal_id = cal_id.strip()
-                    if cal_id and cal_id not in calendar_ids:
-                        calendar_ids.append(cal_id)
-            except Exception:
-                continue
+            if "calendar.google.com" in src.lower() and src not in embed_urls:
+                embed_urls.append(src)
     except Exception:
         pass
 
     rows = []
 
-    # Fetch public ICS feeds using Playwright's request context so Railway uses
-    # the same outbound environment as the browser.
-    for cal_id in calendar_ids:
-        encoded_id = quote(cal_id, safe="")
-        ics_url = f"https://calendar.google.com/calendar/ical/{encoded_id}/public/basic.ics"
-
+    # Open each Google Calendar separately so the rendered text is isolated.
+    for embed_src in embed_urls:
+        agenda_url = _google_embed_for_date(embed_src, selected)
+        cal_page = page.context.new_page()
         try:
-            response = page.request.get(ics_url, timeout=20_000)
-            if not response.ok:
-                continue
-            ics_text = response.text()
-            rows.extend(_parse_google_ics(ics_text, selected, ics_url))
-        except Exception:
-            continue
-
-    # De-duplicate in case the same calendar is embedded twice.
-    if rows:
-        unique = []
-        seen = set()
-        for row in rows:
-            key = (
-                row["date"],
-                row["start"],
-                row["end"],
-                row["session"],
+            cal_page.goto(
+                agenda_url,
+                wait_until="domcontentloaded",
+                timeout=45_000,
             )
-            if key not in seen:
-                seen.add(key)
-                unique.append(row)
-        return unique
+            try:
+                cal_page.wait_for_load_state("networkidle", timeout=12_000)
+            except PlaywrightTimeoutError:
+                pass
+            cal_page.wait_for_timeout(2500)
 
-    # Fallback: old rendered-page/frame scraping.
-    rows = scrape_all_scopes(page, rink, start, end)
-    filtered = []
+            # Main Google document first.
+            try:
+                body = cal_page.locator("body").inner_text(timeout=7000)
+                rows.extend(
+                    _pond_event_rows_from_text(body, selected, agenda_url)
+                )
+            except Exception:
+                pass
+
+            # Also inspect child frames in case Google nests rendered content.
+            for frame in cal_page.frames:
+                if frame == cal_page.main_frame:
+                    continue
+                try:
+                    body = frame.locator("body").inner_text(timeout=5000)
+                    rows.extend(
+                        _pond_event_rows_from_text(body, selected, agenda_url)
+                    )
+                except Exception:
+                    continue
+        finally:
+            cal_page.close()
+
+    # Strict de-duplication. The same event can appear in both main document
+    # and child frame, but Barn Time and Pond Time at the same clock time are
+    # intentionally separate because session name is part of the key.
+    unique = []
+    seen = set()
     for row in rows:
-        if not row["date"]:
-            filtered.append(row)
-            continue
-        try:
-            d = date.fromisoformat(row["date"])
-            if start <= d <= end:
-                filtered.append(row)
-        except ValueError:
-            filtered.append(row)
+        key = (
+            row["date"],
+            row["start"],
+            row["end"],
+            row["session"],
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
 
-    return filtered
+    return unique
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
